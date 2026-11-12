@@ -106,6 +106,10 @@ _Avoid_: run, job, task, invocation
 执行在等外部答复时释放自己，收到答复后重放到该调用点并继续。
 _Avoid_: pause, suspend, await
 
+**Tool**:
+一个暴露给 agent 的具名操作。它把结构化参数翻译成一个 Workspace 调用，再把结果或错误翻译回模型能读的形状。它自己不持有状态。
+_Avoid_: function, action, command（`command` 指 exec 的输入）
+
 ### 生命周期与部署
 
 **Incarnation**:

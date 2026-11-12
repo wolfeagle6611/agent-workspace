@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gitlab.webullbroker.com/webull-go/agent-design/internal/runtime"
@@ -71,5 +72,48 @@ func TestExecWritesThroughTheMount(t *testing.T) {
 	}
 	if _, err := os.Stat(point); !os.IsNotExist(err) {
 		t.Fatalf("mount point %s still present after close: %v", point, err)
+	}
+}
+
+// TestExecChmodThroughTheMount is the step-7a acceptance test: a command that
+// sets the execute bit gets a file that really runs. Before this step the
+// kernel's mode was dropped and chmod reported success anyway.
+func TestExecChmodThroughTheMount(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		t.Skip("no /dev/fuse")
+	}
+	ctx := context.Background()
+	dir := t.TempDir()
+	w, err := Open(filepath.Join(dir, "ws.db"), Options{MountRoot: filepath.Join(dir, "mnt")})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	cmd := `printf '#!/bin/sh\necho ran\n' > s.sh && chmod +x s.sh && ./s.sh`
+	ex, err := w.Exec(ctx, cmd, runtime.ExecOptions{})
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	res, err := ex.Result(ctx)
+	if err != nil {
+		t.Fatalf("result: %v", err)
+	}
+	if res.Status != runtime.Completed || res.ExitCode != 0 {
+		t.Fatalf("status %v exit %d stderr %q", res.Status, res.ExitCode, res.Output.Stderr.Tail)
+	}
+	if !strings.Contains(string(res.Output.Stdout.Tail), "ran") {
+		t.Fatalf("stdout %q, want ran", res.Output.Stdout.Tail)
+	}
+
+	st, err := w.Stat(ctx, "/s.sh")
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if st.Mode&0o111 == 0 {
+		t.Fatalf("mode = %o, execute bit did not survive chmod", st.Mode)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
 	}
 }

@@ -226,6 +226,11 @@ func (v *Volume) Truncate(ctx context.Context, path string, size int64) error {
 	return v.store.Truncate(ctx, path, size, nil)
 }
 
+// Chmod sets a node's permission bits.
+func (v *Volume) Chmod(ctx context.Context, path string, mode uint32) error {
+	return v.store.Chmod(ctx, path, mode, nil)
+}
+
 // OpenHandles reports how many handles are open. Used by tests and by the
 // leak counter the mount reports on Close.
 func (v *Volume) OpenHandles() int {

@@ -141,6 +141,53 @@ func (s *Store) Truncate(ctx context.Context, path string, size int64, opts *Mut
 	})
 }
 
+// Chmod sets a node's permission bits.
+//
+// FUSE sends every SETATTR that carries a mode here. A file change is logged
+// so the new mode reaches a mirror; a directory's is not, because directory
+// creation does not log either (go-mapping §5.1). Setting the mode a node
+// already has mints no rev, the way renaming a path onto itself does not.
+func (s *Store) Chmod(ctx context.Context, path string, mode uint32, opts *MutateOptions) error {
+	clean, err := Clean(path)
+	if err != nil {
+		return err
+	}
+	want := opts.baseRev()
+	mode &= 0o7777
+
+	return s.withWrite(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		inode, err := resolveInode(ctx, tx, clean)
+		if err != nil {
+			return notFoundPath(err, path)
+		}
+		node, err := nodeRow(ctx, tx, inode)
+		if err != nil {
+			return notFoundPath(err, path)
+		}
+		if err := checkBaseRev(clean, want, node); err != nil {
+			return err
+		}
+		if mode == node.Mode {
+			return nil
+		}
+
+		rev, err := mintRev(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE vfs_nodes SET mode = ?, rev = ? WHERE inode = ?`,
+			mode, rev, inode,
+		); err != nil {
+			return wrapError(CodeInvalid, path, err)
+		}
+		if node.Type == TypeDir {
+			return nil
+		}
+		return logChange(ctx, tx, rev, clean, KindFile, mode, node.MTime)
+	})
+}
+
 // Remove deletes a file or an empty directory.
 func (s *Store) Remove(ctx context.Context, path string, opts *MutateOptions) error {
 	clean, err := Clean(path)

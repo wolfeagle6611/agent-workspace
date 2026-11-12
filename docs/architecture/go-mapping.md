@@ -3,7 +3,7 @@
 > 目标：在 Go 里做同构系统——权威存储 + 可插拔执行后端。
 > 评级只对机制，不对代码。每行结论只能是 **照搬 / 改造 / 不要照搬**。
 
-> 阶段划分见 §2 与 ADR 0006：第一阶段只有 `sync: "none"` 的本地后端。
+> 阶段划分见 §5 与 ADR 0006 / 0008 / 0009：第一阶段只有 `sync: "none"` 的本地后端，第二阶段加同步与远端执行，第三阶段接首个真实调用方。
 
 ## 1. 评级表
 
@@ -211,8 +211,30 @@ func (w *Workspace) execContainer(ctx context.Context, cmd string, opts ExecOpti
 | 6a | （第二阶段）变更日志 + 水位 + 合并分页 + 应用 + 探测补字节 + 帧编解码（`internal/peer`）+ `net.Pipe` 假对端 | 五个断点全绿：探测之后、字节发一半、第一批应用之后、应用已提交而回复丢失、pull 首页之后 |
 | 6b | （第二阶段）`serve` 子命令 + 握手 + `Result.Sync` + 执行包夹 | 杀掉对端后重连，续传不重复应用 |
 | 6c | （第二阶段）远端执行协议：`exec` / 输出流 / `kill` + `remote` 后端 | 命令跑在镜像的挂载点里，写入经 pull 回到宿主；超时杀整个进程组，结果 `Cancelled` 与 `ExitCode -1` |
+| 7a | （第三阶段）`chmod`：`vfs.Chmod` + `Volume.Chmod` + FUSE `Setattr` 处理 `mode` | 命令里 `chmod +x` 后文件真能执行；模式未变不铸 `rev`；镜像收到新 `mode` |
+| 7b | （第三阶段）MCP 骨架：`mcp --db` 子命令、stdio、`read` / `ls` | pi 连上后能列目录、读文件，结果带 `rev` 与条目大小 |
+| 7c | （第三阶段）`write` / `edit` + 可选 `baseRev` + `ENOMATCH` | 两个写者共读一个 `rev`：一个成功，另一个得 `ECONFLICT` 带 `CurrentRev`；抄错旧文本得 `ENOMATCH` |
+| 7d | （第三阶段）`exec` 工具 + 结果映射 | 模型拿到 `status` / `exitCode` / 两个流的尾窗 / 两个全文路径 / `sync`；三万行输出尾窗有界 |
+| 7e | （第三阶段）验收场景 + 文档 | 八步脚本全绿：写脚本、`chmod`、执行、冲突、`ENOMATCH`、截断、重启存活、无残留 |
 
-第 1–2 步之前不要碰执行面。第 6a 步之前不要写水位表：没有对手方时，那些表只会腐烂。6a 与 6b 的形状见 ADR 0008。
+第 1–2 步之前不要碰执行面。第 6a 步之前不要写水位表：没有对手方时，那些表只会腐烂。6a 与 6b 的形状见 ADR 0008。第 7a 步先做，因为它是最小的正确性修复，且第 7e 步要靠它。
+
+### 5.1 第三阶段已定约定
+
+首个调用方是 pi，经 MCP stdio 接入。写者分类见 ADR 0009。
+
+| 主题 | 决定 | 理由 |
+| --- | --- | --- |
+| 调用方 | pi 经 MCP stdio；一个服务一个工作区（`--db`），工具不带工作区参数 | 现有唯一能立刻接的客户端；一库一进程沿用第一、二阶段 |
+| 包布局 | 工具与协议同住 `internal/mcp` | 只有一个协议；早拆多一层只用一次的抽象 |
+| 工具清单 | `read` / `write` / `edit` / `ls` / `exec`；不做 `stat` / `mv` / `rm` | 后三者用 `exec` 就够；`publish` 与 artifacts 属 §8 第 4 项 |
+| 工具写入与 `baseRev` | `read` 返回 `rev`；`write` / `edit` 接受可选 `rev`，并在结果里返回新 `rev`；`exec` 仍不带（ADR 0009） | 工具是唯一既能读版本又能写版本的写者；不强制，否则每个调用都要先读；返回新 `rev` 让模型能连续编辑 |
+| `edit` 的匹配失败 | 工具层码 `ENOMATCH`，不进 `vfs` 错误表 | `vfs` 不做内容匹配；模型要区分抄错旧文本与并发改写 |
+| `chmod` 语义 | 文件：铸 `rev` 并写一条 `KindFile` 变更行；模式未变不铸；目录：铸 `rev` 不写行 | `mode` 已在变更条目里，写行即传播；目录沿用空目录不传播的约定 |
+| MCP 错误形状 | 工具结果 `isError: true`，正文以码开头（`ECONFLICT path=/a baseRev=5 currentRev=7`） | 协议错误会丢掉字段；调用方只需一条分支 |
+| `exec` 结果映射 | 只给 `status` / `exitCode` / 两个流的尾窗 / 两个全文路径 / `sync` | `pushed` / `pulled` 是诊断数字；合并两个流会丢定位信息 |
+| 验收环境 | Linux 容器内跑；macOS 只跑单元测试 | 本机没有 macFUSE，`exec` 不可用；判定不依赖个人机器 |
+| 验收编码 | `//go:build linux` 的 Go 测试 + `scripts/acceptance.sh` | 与 `mount_linux_test.go` 同一条路子，失败能定位到行 |
 
 ## 6. 第一阶段已定约定
 
@@ -338,7 +360,7 @@ func (e *Error) Unwrap() []error   // 按 Code 返回对应哨兵，让 errors.I
 | 2 | 模块后端（goja 等） | 最容易后加 | 需要隔离 JS 时 |
 | 3 | data mount（外部来源铺子树） | 没有对应数据源 | 需要预置只读内容时 |
 | 4 | git 客户端、artifacts、assets | 外围能力 | 底层稳定后 |
-| 5 | agent 工具适配器 | 先有底座再谈上层 | 有第一个真实调用方时 |
+| 5 | agent 工具适配器 | 先有底座再谈上层 | 已落地：7b–7d（`internal/mcp`） |
 | 6 | 多租户鉴权与配额 | 本地单用户部署，鉴权属部署层 | 变多租户时 |
 | 7 | 快照 / 时间旅行 / fork | 需要历史，与续传点语义冲突 | 需要审计时 |
 | 7a | 空目录同步 | 目录创建不产生变更事件（§6），目录随子项出现 | 调用方依赖空目录时 |
@@ -346,7 +368,11 @@ func (e *Error) Unwrap() []error   // 按 Code 返回对应哨兵，让 errors.I
 | 9 | 内容定义分块 | 固定分块够用 | 出现大量插入型大文件写 |
 | 10 | 后台 GC 守护进程 | 改在 `Close` 时与阈值触发 | 出现长时间常驻工作区 |
 | 11 | Windows 支持 | 进程组与 FUSE 都要分支，成本翻倍 | 明确有需求时 |
-| 12 | `Setattr` 改权限（`chmod`） | 目前只落 `Create` / `Mkdir` 的 `mode`，修改权限没有入口 | 有调用方依赖权限位时 |
+| 12 | `Setattr` 改权限（`chmod`） | 目前只落 `Create` / `Mkdir` 的 `mode`，修改权限没有入口 | 已落地：7a（`vfs.Chmod`） |
 | 13 | `Truncate` 的增量实现 | 现在整文件读出再写回；大文件截断会占满内存 | 出现真实的大文件截断 |
 
 第 7 项与 Q19 的选择绑定：选了续传点，就没有历史可回放。要做快照，先回来改 Q19。
+
+第三阶段（7a–7e）不取上表任何一项。第 5 与第 12 项已在第三阶段落地。`publish`、artifacts、git 客户端仍归第 4 项。
+
+一条登记不删的死码：`internal/vfs/errors.go` 的 `CodeSyncLost` 与 `ErrSyncLost` 没有调用点，与 ADR 0008「删掉 `ESYNC_LOST`」冲突。本阶段只登记，等下次动错误表时一起处理。

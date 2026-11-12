@@ -6,6 +6,9 @@
 //
 // The same binary is the peer. Wrapping it in a container is a launcher
 // change, not a protocol change.
+//
+// `mcp` exposes the store to an agent over the Model Context Protocol on
+// stdio (go-mapping §5.1).
 package main
 
 import (
@@ -22,22 +25,57 @@ import (
 	"sync"
 	"syscall"
 
+	"gitlab.webullbroker.com/webull-go/agent-design/internal/mcp"
 	"gitlab.webullbroker.com/webull-go/agent-design/internal/mount"
 	"gitlab.webullbroker.com/webull-go/agent-design/internal/peer"
 	"gitlab.webullbroker.com/webull-go/agent-design/internal/vfs"
+	"gitlab.webullbroker.com/webull-go/agent-design/internal/workspace"
 )
 
 func main() {
-	if len(os.Args) < 2 || os.Args[1] != "serve" {
-		fmt.Fprintln(os.Stderr, "usage: agent-design serve --db <path> --socket <path>")
+	usage := "usage: agent-design serve --db <path> --socket <path>\n" +
+		"       agent-design mcp --db <path>"
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, usage)
 		os.Exit(2)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := serve(ctx, os.Args[2:]); err != nil {
+
+	var err error
+	switch os.Args[1] {
+	case "serve":
+		err = serve(ctx, os.Args[2:])
+	case "mcp":
+		err = serveMCP(ctx, os.Args[2:])
+	default:
+		fmt.Fprintln(os.Stderr, usage)
+		os.Exit(2)
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "agent-design:", err)
 		os.Exit(1)
 	}
+}
+
+// serveMCP answers MCP requests on stdin and stdout. An agent harness starts
+// it; one process serves one workspace, so no tool names a workspace.
+func serveMCP(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	db := flags.String("db", "", "path of the workspace database")
+	mountRoot := flags.String("mount-root", "", "directory mount points live in")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *db == "" {
+		return errors.New("--db is required")
+	}
+	w, err := workspace.Open(*db, workspace.Options{MountRoot: *mountRoot})
+	if err != nil {
+		return err
+	}
+	defer w.Close()
+	return mcp.NewServer(w).Serve(ctx, os.Stdin, os.Stdout)
 }
 
 // serve listens on a unix socket and answers the sync protocol.

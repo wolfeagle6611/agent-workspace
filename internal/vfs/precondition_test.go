@@ -50,6 +50,9 @@ func TestPreconditionsOnEveryMutation(t *testing.T) {
 		"Remove": func(s *Store, rev *int64) error {
 			return s.Remove(ctx, "/w/f", &MutateOptions{BaseRev: rev})
 		},
+		"Chmod": func(s *Store, rev *int64) error {
+			return s.Chmod(ctx, "/w/f", 0o600, &MutateOptions{BaseRev: rev})
+		},
 	}
 	for name, op := range ops {
 		t.Run(name, func(t *testing.T) {

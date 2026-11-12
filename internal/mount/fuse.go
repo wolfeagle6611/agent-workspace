@@ -163,6 +163,11 @@ func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 }
 
 func (n *node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	if mode, ok := in.GetMode(); ok {
+		if err := n.vol.Chmod(ctx, n.path, mode); err != nil {
+			return errno(err)
+		}
+	}
 	if size, ok := in.GetSize(); ok {
 		if err := n.vol.Truncate(ctx, n.path, int64(size)); err != nil {
 			return errno(err)
