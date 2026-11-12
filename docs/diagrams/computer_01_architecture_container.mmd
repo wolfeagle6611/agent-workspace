@@ -1,0 +1,40 @@
+%% Cloudflare Computer — 容器视图（C4 Container 层，flowchart 替代 C4 语法）
+flowchart TB
+  subgraph Caller["调用方"]
+    A["🤖 Agent 代码 / Worker fetch"]
+  end
+
+  subgraph Edge["Cloudflare 边缘"]
+    DO["📦 Durable Object<br/>Workspace + SQLite<br/>权威状态"]
+    R2[("🪣 R2")]
+    ART["📚 Artifacts"]
+    ASSET["🖼️ Assets"]
+  end
+
+  subgraph Container["沙箱容器 (Linux)"]
+    CD["⚙️ computerd<br/>HTTP/WS + FUSE + exec"]
+    CV[("💾 容器侧 VFS<br/>进程生命周期")]
+    BIN["🔧 真实二进制<br/>git / npm / pandoc"]
+  end
+
+  subgraph Dyn["Dynamic Worker"]
+    CM["🧩 codemode 模块<br/>无网络 / 无真实 FS"]
+  end
+
+  A -->|"Workers RPC / HTTP"| DO
+  DO -->|"capnweb over WebSocket<br/>反向拨号"| CD
+  CD --- CV
+  CD --- BIN
+  DO -.->|"CodemodeBackend"| CM
+  DO -->|"data mount (只读)"| R2
+  DO --> ART
+  DO --> ASSET
+
+  classDef primary fill:#90EE90,stroke:#333,stroke-width:2px,color:darkgreen
+  classDef secondary fill:#87CEEB,stroke:#333,stroke-width:2px,color:darkblue
+  classDef storage fill:#E6E6FA,stroke:#333,stroke-width:2px,color:darkblue
+  classDef warn fill:#FFB6C1,stroke:#DC143C,stroke-width:2px,color:black
+  class DO primary
+  class A,CM secondary
+  class R2,CV,ART,ASSET,BIN storage
+  class CD warn

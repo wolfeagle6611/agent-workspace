@@ -1,0 +1,47 @@
+%% Cloudflare Computer — 组件视图（DO 内部 / 容器内部 / 线协议边界）
+flowchart LR
+  subgraph DOside["Durable Object 内部"]
+    WS["Workspace<br/>push / pull / ready / stub"]
+    WFS["WorkspaceFilesystem<br/>readFile / writeFile / mkdir / rm ..."]
+    PRV["SQLiteWorkspaceProvider<br/>路径 → inode 解析"]
+    RT["WorkspaceRuntime<br/>exec / getExec / killExec"]
+    SYN["Sync driver<br/>pushOnce / pullOnce / reconcile"]
+    MNT["MountIndex<br/>data mount 索引"]
+    DB[("SQLite<br/>vfs_* / _vfs_*")]
+    WS --> WFS
+    WFS --> PRV
+    PRV --> DB
+    WS --> SYN
+    WS --> RT
+    WS --> MNT
+    MNT --> WFS
+  end
+
+  subgraph Wire["@cloudflare/computer-rpc"]
+    I["WorkspaceRPC<br/>{ sync, shell }"]
+  end
+
+  subgraph Cside["容器内部 computerd"]
+    HTTP["HTTP 服务<br/>/health /connect /api"]
+    FDRV["FUSE driver"]
+    SVR["SyncRPC server<br/>push / fetchChanges / hasObjects"]
+    EXE["exec runner<br/>进程表 + 事件日志"]
+    CFS[("容器侧 VFS")]
+    HTTP --> SVR
+    HTTP --> EXE
+    FDRV --> CFS
+    SVR --> CFS
+    EXE --> CFS
+  end
+
+  SYN <-->|"capnweb"| I
+  RT <-->|"shell half"| I
+  I <-->|"WebSocket"| HTTP
+
+  classDef primary fill:#90EE90,stroke:#333,stroke-width:2px,color:darkgreen
+  classDef secondary fill:#87CEEB,stroke:#333,stroke-width:2px,color:darkblue
+  classDef storage fill:#E6E6FA,stroke:#333,stroke-width:2px,color:darkblue
+  class WS,WFS,PRV,RT,SYN,MNT primary
+  class I secondary
+  class HTTP,FDRV,SVR,EXE secondary
+  class DB,CFS storage

@@ -1,0 +1,32 @@
+%% Cloudflare Computer — 一次 exec 的完整同步往返
+sequenceDiagram
+  autonumber
+  participant App as 调用方
+  participant WS as Workspace in DO
+  participant DB as SQLite in DO
+  participant CD as computerd
+  participant CFS as 容器侧 VFS
+
+  App->>WS: runtime.exec("npm test", { backend })
+  Note over WS: 同步包夹开始
+  WS->>DB: 读 pushRev
+  WS->>CD: push({ senderRev, changes })
+  WS->>CD: hasObjects(本批引用的哈希)
+  CD-->>WS: 已有这些，其余请补
+  WS->>CD: pushObjects(缺失字节)
+  CD->>CFS: applyChanges
+  CD-->>WS: { rev, appliedPushCursor }
+  Note over WS: 断言 appliedPushCursor 覆盖 pushRev
+
+  WS->>CD: spawn(command)
+  CD->>CFS: FUSE 写入即时可见
+  CD-->>WS: events（stdout/stderr/exit）
+
+  WS->>CD: fetchChanges({ after: fetchCursor })
+  CD->>CFS: 物化当前状态
+  CD-->>WS: ChangeEntry 流（chunks: hash,size）
+  WS->>WS: 按 256 条一批，探测已有 blob
+  WS->>CD: fetchObjects(缺失哈希)
+  CD-->>WS: { hash, bytes }
+  WS->>DB: applyChanges + 推进 (rev,path) 游标
+  WS-->>App: WorkspaceRuntimeResult
