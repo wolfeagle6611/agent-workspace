@@ -110,8 +110,7 @@ type Exec struct {
 type Result struct {
 	Status   Status          // Completed | Failed | Cancelled
 	ExitCode int
-	Stdout   []byte
-	Stderr   []byte
+	Output   execout.Result  // 两个流的尾部、全文路径、总量、截断标记
 	Value    any             // 仅模块后端
 	Pushed   int
 	Pulled   int
@@ -223,19 +222,25 @@ func (w *Workspace) execContainer(ctx context.Context, cmd string, opts ExecOpti
 | 挂载点 | `/run/ws/<id>`；`Open` 原子创建并惰性卸载残留；`Close` 卸载后删除 | 僵尸挂载是这类系统最常见的运维事故 |
 | FUSE 适配层 | go-fuse 只做 syscall → `Volume` 的翻译；entry / attr / negative 超时全为 0 | 规则都留在可测的 `Volume` 里；开缓存会让挂载点与库不一致 |
 | 读路径 | `ReadAt` 只读命中的 chunk；`Object` 按哈希取一片 | FUSE 的 `read()` 不把整文件读进内存 |
-| 取消 | 进程组 `SIGTERM`，宽限 5 秒，再 `SIGKILL` | 防孤儿进程继续写工作区 |
 | 测试 | FUSE 集成测试仅 Linux CI；单元测试直接打 `fs` 层 | 不维护两套执行语义 |
 | 模块后端 | 第一阶段不做，只定接口 | 最容易后加，且加时不碰主干 |
 | `baseRev` 目录语义 | `mkdir` 查父目录；`rm` 查目标节点，`baseRev=0` 表示“期望不存在”；`rename` 查源节点，目标已存在时另要 `TargetBaseRev` | 只有 `rename` 会覆盖，只有它需要两个前置条件 |
 | FUSE 缓存 | `nodefs` 节点树 + 属性 TTL = 0，先保证 `fs` 与挂载点永远一致 | 没数据证明 `stat` 是瓶颈前，不承担失效 bug 的风险 |
 | 执行记录 | 落库 `exec_id / 命令 / 起止时间 / 状态`；重启后查旧 id 返回 `ErrExecLost`，不是“未知 id” | 区分“丢失”与“不存在”是两种事实 |
-| 输出全文 | 放工作区 `/.computer/output`，保留最近 50 个，路径写进结果 | 与上游路径一致，读取复用现有 `fs` API |
 | 保留路径 | `/.computer` 是系统目录：`readdir("/")` 仍列出它，但备份、`git status`、变更报告默认忽略；不允许在此建立挂载点 | 打破“根下不自动创建”的例外必须显式登记 |
-| 挂载时机 | `mount.Session` 独占挂载协议：`Mount` 惰性且单飞，`Unmount` 顺序为冲缓冲 → 卸载 → 删目录；`Workspace.Close` 只加关库 | 顺序写错就丢缓冲；协议住在挂载包里，调用方无处写错 |
+| 挂载时机 | `mount.Session` 独占挂载协议：`Mount` 惰性且单飞，`Unmount` 顺序为冲缓冲 → 卸载 → 删目录；`Workspace.Close` 先取消执行，等上限，再关库 | 顺序写错就丢缓冲；协议住在挂载包里，调用方无处写错 |
 | 挂载点命名 | `<挂载根>/<数据库文件名去扩展名>-<绝对路径哈希前 8 位>` | `Prepare` 会清掉挂载点上的占用者，同名数据库共用挂载点会卸载活工作区并串库 |
 | exec 可见性 | 子进程 `close()` 后可见；未关的写入最多 512 KiB 不可见 | 沿用 FUSE 缓冲规则，不为此改 `Volume` |
 | exec 命令形状 | `/bin/sh -c`；环境 = 进程环境加 `ExecOptions.Env`；stdin 为空设备 | 上游 `source` 是 shell 命令；继承环境让 `git` / `go` 可用；读 stdin 不会挂死 |
-| exec 取消（第 3 步） | `ctx` 取消 → 杀直接子进程 → `Status Cancelled` 加 `ctx.Err()`；进程组与 5 秒宽限留给第 4 步 | 第 4 步才做进程组，先让“取消”有定义 |
+| exec 取消 | 进程组 SIGTERM，宽限 5 秒，再 SIGKILL；信号结束记 `Status Cancelled` 与 `ExitCode -1`，并带回 `ctx.Err()` | `-1` 保留真实死因；`ctx.Err()` 是调用方区分超时与取消的唯一手段 |
+| exec 超时 | `ExecOptions.Timeout`；从 `Connect` 与 `Resolve` 之后起算 | 首次挂载慢不能伪装成命令超时 |
+| 结果形状 | `Result{Status, ExitCode, Output}`；每个流带 `Tail / Path / Bytes / Lines / Truncated` | 输出是一件事；摊成十二个字段每个后端都要填对 |
+| 尾部窗口 | 字节环，`Finalize` 时再裁到最后 N 行；默认 64 KiB / 2000 行，经 `execout.Limits` 传入 | 字节上限天然成立；行裁剪只发生一次，不进热路径；限额可按后端或配置覆盖 |
+| 输出全文创建 | `Open` 无条件 `MkdirAll("/.computer/output")`，失败即 `Open` 失败 | 列目录在有无命令时一致；半开工作区会让冲突语义变模糊 |
+| 输出写入路径 | 直连 `vfs.Store`，不经 `Volume`；不受 `baseRev`；`rev` 照铸 | 挂载失败也要能落盘；加例外会让第 5 步与第二阶段都要记住它 |
+| 输出裁剪 | 全文放工作区 `/.computer/output/<backend>.<id>.stdout|stderr.log`，路径写进结果；exec 结束时按 `rev` 降序保留最近 50 个条目 | 与上游路径一致，读取复用现有 `fs` API；目录即契约，名字模式不参与裁剪；裁剪失败不改写结果 |
+| 执行与 `Close` | `Close` 取消工作区根 ctx，最多等 5 秒，再关库 | 库不在活写者下面关闭 |
+| 目录创建与 `rev` | `mkdir` 与建目录不推进 `rev`（既有行为） | 第二阶段做变更流时要知道：目录创建不是变更事件 |
 | backend 路由 | `ExecOptions.Backend` 空串 = 唯一注册的后端；多个后端加空串 = `EINVAL`；未注册 id = `ENOBACKEND` | 空串猜错后端比报错更糟 |
 | 执行句柄 | 每次 `Exec` 一次 `Connect` / `Close`；`Result` 可重复调，只等一次 | 子进程后端连接无成本；缓存是远端传输的需要 |
 

@@ -3,11 +3,14 @@ package runtime_test
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"gitlab.webullbroker.com/webull-go/agent-design/internal/backend/shell"
+	"gitlab.webullbroker.com/webull-go/agent-design/internal/execout"
 	"gitlab.webullbroker.com/webull-go/agent-design/internal/runtime"
 	"gitlab.webullbroker.com/webull-go/agent-design/internal/vfs"
 )
@@ -27,10 +30,20 @@ func (h *host) Resolve(ctx context.Context, path string) (string, error) {
 	return filepath.Join(h.point, path), nil
 }
 
+// outputs has no store: these tests care about the execution contract, not
+// about where the text lands.
+type outputs struct{ seen []string }
+
+func (o *outputs) For(ctx context.Context, backendID, execID string) runtime.OutputSink {
+	o.seen = append(o.seen, backendID+"."+execID)
+	return execout.NewSink(ctx, nil, execout.DefaultLimits, "", "")
+}
+
 // handle is a backend that answers with whatever the test says.
 type handle struct {
 	mode   runtime.SyncMode
 	result runtime.Result
+	stdout string
 	calls  int
 	closed int
 	seen   []runtime.Request
@@ -51,6 +64,9 @@ func (h *handle) Exec(ctx context.Context, req runtime.Request) (*runtime.Exec, 
 	h.seen = append(h.seen, req)
 	return &runtime.Exec{Result: func(context.Context) (runtime.Result, error) {
 		h.calls++
+		if h.stdout != "" {
+			_, _ = io.WriteString(req.Output.Stdout(), h.stdout)
+		}
 		return h.result, nil
 	}}, nil
 }
@@ -82,7 +98,7 @@ func codeOf(t *testing.T, err error) string {
 }
 
 func TestUnknownBackendIsNoBackend(t *testing.T) {
-	rt := runtime.New(&host{point: t.TempDir()}, &backend{id: "fake", hdl: newHandle()})
+	rt := runtime.New(&host{point: t.TempDir()}, &outputs{}, &backend{id: "fake", hdl: newHandle()})
 
 	_, err := rt.Exec(context.Background(), "true", runtime.ExecOptions{Backend: "nope"})
 	if !errors.Is(err, vfs.ErrNoBackend) {
@@ -94,7 +110,7 @@ func TestUnknownBackendIsNoBackend(t *testing.T) {
 }
 
 func TestNoRegisteredBackendIsNoBackend(t *testing.T) {
-	rt := runtime.New(&host{point: t.TempDir()})
+	rt := runtime.New(&host{point: t.TempDir()}, &outputs{})
 
 	if _, err := rt.Exec(context.Background(), "true", runtime.ExecOptions{}); !errors.Is(err, vfs.ErrNoBackend) {
 		t.Fatalf("err %v, want ErrNoBackend", err)
@@ -102,7 +118,7 @@ func TestNoRegisteredBackendIsNoBackend(t *testing.T) {
 }
 
 func TestEmptyBackendWithTwoRegisteredIsInvalid(t *testing.T) {
-	rt := runtime.New(&host{point: t.TempDir()},
+	rt := runtime.New(&host{point: t.TempDir()}, &outputs{},
 		&backend{id: "a", hdl: newHandle()},
 		&backend{id: "b", hdl: newHandle()},
 	)
@@ -120,7 +136,7 @@ func TestSingleBackendNeedsNoName(t *testing.T) {
 	dir := t.TempDir()
 	h := &host{point: dir}
 	hdl := newHandle(runtime.Result{Status: runtime.Completed})
-	rt := runtime.New(h, &backend{id: "fake", hdl: hdl})
+	rt := runtime.New(h, &outputs{}, &backend{id: "fake", hdl: hdl})
 
 	ex, err := rt.Exec(context.Background(), "true", runtime.ExecOptions{})
 	if err != nil {
@@ -141,7 +157,7 @@ func TestSingleBackendNeedsNoName(t *testing.T) {
 }
 
 func TestCallerSuppliedIDWins(t *testing.T) {
-	rt := runtime.New(&host{point: t.TempDir()}, &backend{id: "fake", hdl: newHandle()})
+	rt := runtime.New(&host{point: t.TempDir()}, &outputs{}, &backend{id: "fake", hdl: newHandle()})
 
 	ex, err := rt.Exec(context.Background(), "true", runtime.ExecOptions{ID: "mine"})
 	if err != nil {
@@ -154,7 +170,7 @@ func TestCallerSuppliedIDWins(t *testing.T) {
 
 func TestRemoteSyncBackendIsRefused(t *testing.T) {
 	hdl := &handle{mode: runtime.SyncRemote}
-	rt := runtime.New(&host{point: t.TempDir()}, &backend{id: "fake", hdl: hdl})
+	rt := runtime.New(&host{point: t.TempDir()}, &outputs{}, &backend{id: "fake", hdl: hdl})
 
 	_, err := rt.Exec(context.Background(), "true", runtime.ExecOptions{})
 	if !errors.Is(err, vfs.ErrInvalid) {
@@ -167,7 +183,7 @@ func TestRemoteSyncBackendIsRefused(t *testing.T) {
 
 func TestResolveFailureClosesTheHandle(t *testing.T) {
 	hdl := newHandle()
-	rt := runtime.New(&host{err: vfs.NewError(vfs.CodeNotFound, "/nope")},
+	rt := runtime.New(&host{err: vfs.NewError(vfs.CodeNotFound, "/nope")}, &outputs{},
 		&backend{id: "fake", hdl: hdl})
 
 	_, err := rt.Exec(context.Background(), "true", runtime.ExecOptions{Cwd: "/nope"})
@@ -180,8 +196,9 @@ func TestResolveFailureClosesTheHandle(t *testing.T) {
 }
 
 func TestResultIsRepeatable(t *testing.T) {
-	hdl := newHandle(runtime.Result{Status: runtime.Completed, Stdout: []byte("once")})
-	rt := runtime.New(&host{point: t.TempDir()}, &backend{id: "fake", hdl: hdl})
+	hdl := newHandle(runtime.Result{Status: runtime.Completed})
+	hdl.stdout = "once"
+	rt := runtime.New(&host{point: t.TempDir()}, &outputs{}, &backend{id: "fake", hdl: hdl})
 
 	ex, err := rt.Exec(context.Background(), "true", runtime.ExecOptions{})
 	if err != nil {
@@ -195,8 +212,8 @@ func TestResultIsRepeatable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second result: %v", err)
 	}
-	if string(first.Stdout) != "once" || string(second.Stdout) != "once" {
-		t.Fatalf("results %q / %q, want once twice", first.Stdout, second.Stdout)
+	if string(first.Output.Stdout.Tail) != "once" || string(second.Output.Stdout.Tail) != "once" {
+		t.Fatalf("results %q / %q, want once twice", first.Output.Stdout.Tail, second.Output.Stdout.Tail)
 	}
 	if hdl.calls != 1 {
 		t.Fatalf("backend ran %d times, want 1", hdl.calls)
@@ -225,10 +242,11 @@ func TestCallerUnchangedAcrossBackends(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
-	hdl := newHandle(runtime.Result{Status: runtime.Completed, Stdout: []byte("faked")})
+	hdl := newHandle(runtime.Result{Status: runtime.Completed})
+	hdl.stdout = "faked"
 	fake := &backend{id: "fake", hdl: hdl}
-	scripted := runtime.New(&host{point: dir}, fake)
-	real := runtime.New(&host{point: dir}, shell.New())
+	scripted := runtime.New(&host{point: dir}, &outputs{}, fake)
+	real := runtime.New(&host{point: dir}, &outputs{}, shell.New())
 
 	for _, tc := range []struct {
 		name string
@@ -245,8 +263,8 @@ func TestCallerUnchangedAcrossBackends(t *testing.T) {
 		if res.Status != runtime.Completed {
 			t.Fatalf("%s: status %v, want Completed", tc.name, res.Status)
 		}
-		if string(res.Stdout) != tc.want {
-			t.Fatalf("%s: stdout %q, want %q", tc.name, res.Stdout, tc.want)
+		if string(res.Output.Stdout.Tail) != tc.want {
+			t.Fatalf("%s: stdout %q, want %q", tc.name, res.Output.Stdout.Tail, tc.want)
 		}
 	}
 
@@ -260,5 +278,89 @@ func TestCallerUnchangedAcrossBackends(t *testing.T) {
 	}
 	if string(got) != "hi" {
 		t.Fatalf("f = %q, want hi", got)
+	}
+}
+
+func TestTimeoutCancelsTheCommand(t *testing.T) {
+	rt := runtime.New(&host{point: t.TempDir()}, &outputs{}, shell.New())
+
+	start := time.Now()
+	ex, err := rt.Exec(context.Background(), "sleep 10",
+		runtime.ExecOptions{Timeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	res, err := ex.Result(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err %v, want DeadlineExceeded", err)
+	}
+	if res.Status != runtime.Cancelled {
+		t.Fatalf("status %v, want Cancelled", res.Status)
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("timeout took %s: the command kept running", took)
+	}
+}
+
+func TestOutputIsNamedForTheExecution(t *testing.T) {
+	h := &host{point: t.TempDir()}
+	o := &outputs{}
+	hdl := newHandle()
+	rt := runtime.New(h, o, &backend{id: "fake", hdl: hdl})
+
+	ex, err := rt.Exec(context.Background(), "true", runtime.ExecOptions{ID: "exec-7"})
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if _, err := ex.Result(context.Background()); err != nil {
+		t.Fatalf("result: %v", err)
+	}
+	if len(o.seen) != 1 || o.seen[0] != "fake.exec-7" {
+		t.Fatalf("output targets %v, want [fake.exec-7]", o.seen)
+	}
+}
+
+// storeHost is a host with a real store: it is the workspace wiring without
+// the FUSE mount, so the whole output path runs on any platform.
+type storeOutputs struct{ store *vfs.Store }
+
+func (o *storeOutputs) For(ctx context.Context, backendID, execID string) runtime.OutputSink {
+	path := "/.computer/output/" + backendID + "." + execID
+	return execout.NewSink(ctx, o.store, execout.DefaultLimits, path+".stdout.log", path+".stderr.log")
+}
+
+func TestShellOutputLandsInTheStore(t *testing.T) {
+	ctx := context.Background()
+	store, err := vfs.Open(filepath.Join(t.TempDir(), "ws.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+	if err := store.MkdirAll(ctx, "/.computer/output"); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	rt := runtime.New(&host{point: t.TempDir()}, &storeOutputs{store: store}, shell.New())
+	ex, err := rt.Exec(ctx, "seq 1 100000", runtime.ExecOptions{})
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	res, err := ex.Result(ctx)
+	if err != nil {
+		t.Fatalf("result: %v", err)
+	}
+	out := res.Output.Stdout
+	if res.Status != runtime.Completed || out.Bytes == 0 {
+		t.Fatalf("status %v bytes %d", res.Status, out.Bytes)
+	}
+	if !out.Truncated || len(out.Tail) > 64<<10 {
+		t.Fatalf("truncated %v tail %d bytes", out.Truncated, len(out.Tail))
+	}
+	full, err := store.ReadFile(ctx, out.Path)
+	if err != nil {
+		t.Fatalf("read back %s: %v", out.Path, err)
+	}
+	if int64(len(full)) != out.Bytes {
+		t.Fatalf("stored %d bytes, counted %d", len(full), out.Bytes)
 	}
 }

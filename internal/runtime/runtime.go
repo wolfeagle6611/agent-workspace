@@ -1,8 +1,9 @@
 // Package runtime is the single execution entry: one Exec call, one backend
 // picked by id, one Result.
 //
-// It holds no filesystem semantics. The workspace that owns the runtime is
-// the Host: it turns a workspace path into a real path. See
+// It holds no filesystem semantics. Two collaborator interfaces carry the
+// knowledge it must not have: Host answers what a backend asks, Outputs
+// answers where the output of one execution goes. See
 // docs/architecture/go-mapping.md §3.2 and ADR 0002.
 package runtime
 
@@ -11,9 +12,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"io"
 	"sort"
 	"sync"
+	"time"
 
+	"gitlab.webullbroker.com/webull-go/agent-design/internal/execout"
 	"gitlab.webullbroker.com/webull-go/agent-design/internal/vfs"
 )
 
@@ -37,6 +41,25 @@ type Host interface {
 	Resolve(ctx context.Context, path string) (string, error)
 }
 
+// Outputs allocates the output target of one execution. Runtime asks for it;
+// a backend never does, so it stays out of Host.
+type Outputs interface {
+	// For names the target for one execution. The ids reach the file names,
+	// because the whole text lands in the workspace under those names. It
+	// never returns nil.
+	For(ctx context.Context, backendID, execID string) OutputSink
+}
+
+// OutputSink is the per-execution output target. Backends only see
+// io.Writer; Runtime calls Finalize.
+type OutputSink interface {
+	Stdout() io.Writer
+	Stderr() io.Writer
+	// Finalize flushes pending bytes and returns the tails. Runtime calls it
+	// once, after the backend's Result returns.
+	Finalize(ctx context.Context) (execout.Result, error)
+}
+
 // Backend turns itself into a Handle. It holds no execution semantics and
 // no route back to the caller.
 type Backend interface {
@@ -46,6 +69,15 @@ type Backend interface {
 }
 
 // Handle is one connection to a backend. It lives for one Exec.
+//
+// The base interface stays narrow. A capability that only some backends have
+// (sync client, event stream, session reuse) is a separate interface the
+// caller asserts with a type switch, not a new method here: a new method
+// breaks every backend, including the ones that do not need it.
+//
+// Cancellation is the backend's job. A backend must end the whole process
+// set, not only the direct child, and report Status Cancelled with
+// ExitCode -1 and ctx.Err().
 type Handle interface {
 	// Sync reports whether the backend keeps its own storage.
 	Sync() SyncMode
@@ -61,6 +93,7 @@ type ExecOptions struct {
 	Backend string            // routing, not authorisation (ADR 0002)
 	Cwd     string            // absolute workspace path; "" means "/"
 	Env     map[string]string // overrides on top of the process environment
+	Timeout time.Duration     // the command only; zero means no limit
 }
 
 // Request is what a backend receives. Dir is already a real path, so no
@@ -69,6 +102,7 @@ type Request struct {
 	Source string
 	Dir    string
 	Env    map[string]string
+	Output OutputSink // never nil; runtime asks Outputs for it before the start
 }
 
 // Status is how an execution ended. The backend decides it; Runtime does not
@@ -85,8 +119,7 @@ const (
 type Result struct {
 	Status   Status
 	ExitCode int
-	Stdout   []byte
-	Stderr   []byte
+	Output   execout.Result
 }
 
 // Exec is one execution: an id and a result to wait for.
@@ -103,14 +136,19 @@ type Exec struct {
 // Runtime routes the one entry point to the registered backends.
 type Runtime struct {
 	host     Host
+	outputs  Outputs
 	backends map[string]Backend
 	order    []string
 }
 
 // New builds a Runtime. The last registration for an id wins; ids are
 // configuration, and a duplicate is a wiring mistake no caller can see.
-func New(host Host, backends ...Backend) *Runtime {
-	r := &Runtime{host: host, backends: make(map[string]Backend, len(backends))}
+func New(host Host, outputs Outputs, backends ...Backend) *Runtime {
+	r := &Runtime{
+		host:     host,
+		outputs:  outputs,
+		backends: make(map[string]Backend, len(backends)),
+	}
 	for _, b := range backends {
 		r.backends[b.ID()] = b
 		r.order = append(r.order, b.ID())
@@ -146,16 +184,30 @@ func (r *Runtime) Exec(ctx context.Context, source string, opts ExecOptions) (*E
 	if opts.ID == "" {
 		opts.ID = mintID()
 	}
-	ex, err := h.Exec(ctx, Request{Source: source, Dir: dir, Env: opts.Env})
+	out := r.outputs.For(ctx, backend.ID(), opts.ID)
+	// The clock starts at the command, not at the mount: a slow first mount
+	// must not be reported as a command timeout (go-mapping §5 step 4).
+	ctx, cancel := ctx, context.CancelFunc(func() {})
+	if opts.Timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, opts.Timeout)
+	}
+	ex, err := h.Exec(ctx, Request{Source: source, Dir: dir, Env: opts.Env, Output: out})
 	if err != nil {
+		cancel()
 		_ = h.Close()
 		return nil, err
 	}
-	return keep(h, backend.ID(), opts.ID, ex), nil
+	return keep(h, backend.ID(), opts.ID, ex, out, cancel), nil
 }
 
+// finalizeTimeout bounds the flush of an execution that has just ended.
+const finalizeTimeout = 5 * time.Second
+
 // keep makes the result repeatable and ties the handle to the execution.
-func keep(h Handle, backendID, id string, ex *Exec) *Exec {
+//
+// Finalize runs here, not in the backend, so every backend gets the output
+// contract for free.
+func keep(h Handle, backendID, id string, ex *Exec, out OutputSink, cancel context.CancelFunc) *Exec {
 	inner := ex.Result
 	var mu sync.Mutex
 	var once sync.Once
@@ -167,8 +219,18 @@ func keep(h Handle, backendID, id string, ex *Exec) *Exec {
 		defer mu.Unlock()
 		once.Do(func() {
 			res, resErr = inner(ctx)
+			// The command context may already be done, so the flush gets
+			// its own deadline and no inherited cancel.
+			fctx, fcancel := context.WithTimeout(context.WithoutCancel(ctx), finalizeTimeout)
+			outRes, ferr := out.Finalize(fctx)
+			fcancel()
+			cancel()
 			// One Exec, one handle: the connection dies with the work.
 			_ = h.Close()
+			res.Output = outRes
+			if ferr != nil {
+				res.Output.Err = errors.Join(res.Output.Err, ferr)
+			}
 		})
 		return res, resErr
 	}

@@ -35,7 +35,7 @@ func TestExecWritesThroughTheMount(t *testing.T) {
 		t.Fatalf("result: %v", err)
 	}
 	if res.Status != runtime.Completed || res.ExitCode != 0 {
-		t.Fatalf("status %v exit %d stderr %q", res.Status, res.ExitCode, res.Stderr)
+		t.Fatalf("status %v exit %d stderr %q", res.Status, res.ExitCode, res.Output.Stderr.Tail)
 	}
 
 	got, err := w.ReadFile(ctx, "/sub/f")
