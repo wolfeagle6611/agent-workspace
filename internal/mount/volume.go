@@ -48,9 +48,11 @@ func (v *Volume) Open(ctx context.Context, path string, writable bool) (uint64, 
 	return v.add(path, writable), nil
 }
 
-// Create makes path empty and returns a writable handle.
-func (v *Volume) Create(ctx context.Context, path string) (uint64, error) {
-	if err := v.store.WriteFile(ctx, path, nil, nil); err != nil {
+// Create makes path empty and returns a writable handle. mode is the
+// permission bits the caller asked for; zero keeps the current mode, or 0644
+// for a new file.
+func (v *Volume) Create(ctx context.Context, path string, mode uint32) (uint64, error) {
+	if err := v.store.WriteFile(ctx, path, nil, &vfs.MutateOptions{Mode: mode}); err != nil {
 		return 0, err
 	}
 	return v.add(path, true), nil
@@ -207,19 +209,21 @@ func (v *Volume) ReadDir(ctx context.Context, path string) ([]vfs.Dirent, error)
 	return v.store.ReadDir(ctx, path)
 }
 
-// Mkdir creates one directory.
-func (v *Volume) Mkdir(ctx context.Context, path string) error {
-	return v.store.Mkdir(ctx, path)
+// Mkdir creates one directory with the permission bits the kernel asked for.
+// FUSE writers carry no precondition: the kernel cannot express one (see
+// go-mapping §6).
+func (v *Volume) Mkdir(ctx context.Context, path string, mode uint32) error {
+	return v.store.Mkdir(ctx, path, &vfs.MutateOptions{Mode: mode})
 }
 
 // Remove deletes a file or an empty directory.
 func (v *Volume) Remove(ctx context.Context, path string) error {
-	return v.store.Remove(ctx, path)
+	return v.store.Remove(ctx, path, nil)
 }
 
 // Truncate sets a file's length.
 func (v *Volume) Truncate(ctx context.Context, path string, size int64) error {
-	return v.store.Truncate(ctx, path, size)
+	return v.store.Truncate(ctx, path, size, nil)
 }
 
 // OpenHandles reports how many handles are open. Used by tests and by the

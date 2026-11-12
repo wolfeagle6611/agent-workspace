@@ -67,22 +67,22 @@ func TestRemove(t *testing.T) {
 		t.Fatalf("write inner: %v", err)
 	}
 
-	if err := s.Remove(ctx, "/w/dir"); !errors.Is(err, ErrNotEmpty) {
+	if err := s.Remove(ctx, "/w/dir", nil); !errors.Is(err, ErrNotEmpty) {
 		t.Fatalf("remove non-empty dir = %v, want ErrNotEmpty", err)
 	}
-	if err := s.Remove(ctx, "/w/file"); err != nil {
+	if err := s.Remove(ctx, "/w/file", nil); err != nil {
 		t.Fatalf("remove file: %v", err)
 	}
 	if _, err := s.Stat(ctx, "/w/file"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("stat after remove = %v, want ErrNotFound", err)
 	}
-	if err := s.Remove(ctx, "/w/dir/inner"); err != nil {
+	if err := s.Remove(ctx, "/w/dir/inner", nil); err != nil {
 		t.Fatalf("remove inner: %v", err)
 	}
-	if err := s.Remove(ctx, "/w/dir"); err != nil {
+	if err := s.Remove(ctx, "/w/dir", nil); err != nil {
 		t.Fatalf("remove empty dir: %v", err)
 	}
-	if err := s.Remove(ctx, "/"); !errors.Is(err, ErrPerm) {
+	if err := s.Remove(ctx, "/", nil); !errors.Is(err, ErrPerm) {
 		t.Fatalf("remove root = %v, want ErrPerm", err)
 	}
 }
@@ -114,7 +114,7 @@ func TestWriteAtPatchesOnlyTouchedChunks(t *testing.T) {
 	}
 	want := append([]byte(nil), body...)
 	copy(want[64:], patch)
-	if !bytes.Equal(got, want) {
+	if !bytes.Equal(got.Data, want) {
 		t.Fatalf("content mismatch after patch")
 	}
 
@@ -150,7 +150,7 @@ func TestWriteAtCrossesChunkBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if !bytes.Equal(got, want) {
+	if !bytes.Equal(got.Data, want) {
 		t.Fatalf("boundary patch mismatch")
 	}
 }
@@ -169,8 +169,8 @@ func TestWriteAtExtendsWithZeros(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if !bytes.Equal(got, []byte("abc\x00\x00\x00ghi")) {
-		t.Fatalf("got %q", got)
+	if !bytes.Equal(got.Data, []byte("abc\x00\x00\x00ghi")) {
+		t.Fatalf("got %q", got.Data)
 	}
 	st, _ := s.Stat(ctx, "/f")
 	if st.Size != 9 {
@@ -186,8 +186,8 @@ func TestWriteAtCreatesAtZeroOnly(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	got, _ := s.ReadFile(ctx, "/new")
-	if string(got) != "hi" {
-		t.Fatalf("got %q", got)
+	if string(got.Data) != "hi" {
+		t.Fatalf("got %q", got.Data)
 	}
 
 	if err := s.WriteAt(ctx, "/missing", 10, []byte("x")); !errors.Is(err, ErrNotFound) {
@@ -211,22 +211,22 @@ func TestTruncate(t *testing.T) {
 	if err := s.WriteFile(ctx, "/t", body, nil); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if err := s.Truncate(ctx, "/t", 100); err != nil {
+	if err := s.Truncate(ctx, "/t", 100, nil); err != nil {
 		t.Fatalf("shrink: %v", err)
 	}
 	got, _ := s.ReadFile(ctx, "/t")
-	if !bytes.Equal(got, body[:100]) {
+	if !bytes.Equal(got.Data, body[:100]) {
 		t.Fatalf("shrink content mismatch")
 	}
 
-	if err := s.Truncate(ctx, "/t", ChunkSize+5); err != nil {
+	if err := s.Truncate(ctx, "/t", ChunkSize+5, nil); err != nil {
 		t.Fatalf("grow: %v", err)
 	}
 	got, _ = s.ReadFile(ctx, "/t")
-	if int64(len(got)) != ChunkSize+5 {
-		t.Fatalf("grown to %d", len(got))
+	if int64(len(got.Data)) != ChunkSize+5 {
+		t.Fatalf("grown to %d", len(got.Data))
 	}
-	if !bytes.Equal(got[:100], body[:100]) || got[ChunkSize] != 0 {
+	if !bytes.Equal(got.Data[:100], body[:100]) || got.Data[ChunkSize] != 0 {
 		t.Fatalf("grow content mismatch")
 	}
 	st, _ := s.Stat(ctx, "/t")

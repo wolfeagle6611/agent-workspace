@@ -202,7 +202,7 @@ func (w *Workspace) execContainer(ctx context.Context, cmd string, opts ExecOpti
 | 2 | FUSE 挂载（go-fuse）+ 挂载点生命周期 + 残留卸载 | `ls` / `echo >` / `rm` 从挂载点看出与 `fs` 一致；崩溃后 `Open` 能清残留 |
 | 3 | 单一 `Exec` 入口 + 子进程后端（`sync: "none"`） | 换后端不改调用方；子进程写的文件立刻出现在 `fs` 里 |
 | 4 | 取消与超时（进程组）+ 输出截断与落盘 | 超时后无孤儿进程；打印 10 万行不爆内存 |
-| 5 | `baseRev` 前置条件 | 两个并发读-改-写，第二个拿到结构化冲突，不静默丢写 |
+| 5 | `baseRev` 前置条件 | 两个写者共读一个 `rev` 后写同一路径：一个成功，另一个得到 `ECONFLICT` 并带新 `CurrentRev`，可重读重试 |
 | 6 | （第二阶段）远端 / 容器后端 + push / pull + 水位 | 杀掉对端后重连，续传不重复应用 |
 
 第 1–2 步之前不要碰执行面。第 6 步之前不要写水位表：没有对手方时，那些表只会腐烂。
@@ -224,7 +224,14 @@ func (w *Workspace) execContainer(ctx context.Context, cmd string, opts ExecOpti
 | 读路径 | `ReadAt` 只读命中的 chunk；`Object` 按哈希取一片 | FUSE 的 `read()` 不把整文件读进内存 |
 | 测试 | FUSE 集成测试仅 Linux CI；单元测试直接打 `fs` 层 | 不维护两套执行语义 |
 | 模块后端 | 第一阶段不做，只定接口 | 最容易后加，且加时不碰主干 |
-| `baseRev` 目录语义 | `mkdir` 查父目录；`rm` 查目标节点，`baseRev=0` 表示“期望不存在”；`rename` 查源节点，目标已存在时另要 `TargetBaseRev` | 只有 `rename` 会覆盖，只有它需要两个前置条件 |
+| `baseRev` 目录语义 | 每个变更操作的前置条件都指它操作的那个节点：`mkdir` 与 `writeFile` 查目标节点（`baseRev=0` 表示“期望不存在”）；`rm` / `truncate` 查目标节点；`rename` 查源节点，目标已存在时另要 `TargetBaseRev` | 只有 `rename` 会覆盖，只有它需要两个前置条件。父目录 `rev` 不随子项创建而变，查父目录等于不查 |
+| `mkdir` 严格创建 | 目标是任何已存在节点时返回 `EEXIST`，即使 `baseRev` 匹配；`baseRev=0` 时改为 `ECONFLICT` | 一个方法一个契约：`mkdir` 只创建，「确保存在」归 `MkdirAll`。挂载点因此得到 POSIX 的 `EEXIST` |
+| 权限位 | `Create` / `Mkdir` 把内核传来的 `mode` 写进节点；替换文件时若调用方没给 `mode`，保留原值；新文件默认 `0644`，新目录默认 `0755` | 否则 `install -m 600` 在挂载点里静默变成 `0644`，而 `stat` 会报出假值 |
+| `rename` 覆盖规则 | 目标是文件可覆盖；目标是空目录且源是目录可覆盖；非空目录 → `ENOTEMPTY`；文件盖目录 → `EISDIR`，目录盖文件 → `ENOTDIR`；源是 `/` → `EPERM`；目标在源子树内 → `EINVAL`；源等于目标 → 空操作且不铸 `rev` | 结构错误先报，版本冲突后报，调用方能区分“改不合法”与“重读重试” |
+| `rename` 与 `rev` | 一次 `rename` 铸一个 `rev`，并写进被移动节点 | 否则被移动的节点还带着旧 `rev`，按路径读的调用方会拿旧版本号写新路径 |
+| `MkdirAll` 与前置条件 | `MkdirAll` 不接 `MutateOptions`，是幂等的「确保存在」 | 一次创建多层，一个 `rev` 描述不了 |
+| 读-改-写 | `ReadFile` 返回 `Content{Data, Stat}`，一个只读事务里取 | 内容与版本分两次读，任意顺序都可能丢掉并发写；一次事务读出才使 `baseRev` 有意义 |
+| FUSE 与 exec 的前置条件 | 两者的写入都不带 `baseRev`，视为不可中断写者 | 内核与子进程无法携带版本号（ADR 0007）；`baseRev` 只保护 API 写者之间 |
 | FUSE 缓存 | `nodefs` 节点树 + 属性 TTL = 0，先保证 `fs` 与挂载点永远一致 | 没数据证明 `stat` 是瓶颈前，不承担失效 bug 的风险 |
 | 执行记录 | 落库 `exec_id / 命令 / 起止时间 / 状态`；重启后查旧 id 返回 `ErrExecLost`，不是“未知 id” | 区分“丢失”与“不存在”是两种事实 |
 | 保留路径 | `/.computer` 是系统目录：`readdir("/")` 仍列出它，但备份、`git status`、变更报告默认忽略；不允许在此建立挂载点 | 打破“根下不自动创建”的例外必须显式登记 |
@@ -240,7 +247,7 @@ func (w *Workspace) execContainer(ctx context.Context, cmd string, opts ExecOpti
 | 输出写入路径 | 直连 `vfs.Store`，不经 `Volume`；不受 `baseRev`；`rev` 照铸 | 挂载失败也要能落盘；加例外会让第 5 步与第二阶段都要记住它 |
 | 输出裁剪 | 全文放工作区 `/.computer/output/<backend>.<id>.stdout|stderr.log`，路径写进结果；exec 结束时按 `rev` 降序保留最近 50 个条目 | 与上游路径一致，读取复用现有 `fs` API；目录即契约，名字模式不参与裁剪；裁剪失败不改写结果 |
 | 执行与 `Close` | `Close` 取消工作区根 ctx，最多等 5 秒，再关库 | 库不在活写者下面关闭 |
-| 目录创建与 `rev` | `mkdir` 与建目录不推进 `rev`（既有行为） | 第二阶段做变更流时要知道：目录创建不是变更事件 |
+| 目录创建与 `rev` | `mkdir` 推进 `rev`，但不产生变更事件 | 第二阶段做变更流时要知道：有些 `rev` 不对应任何条目 |
 | backend 路由 | `ExecOptions.Backend` 空串 = 唯一注册的后端；多个后端加空串 = `EINVAL`；未注册 id = `ENOBACKEND` | 空串猜错后端比报错更糟 |
 | 执行句柄 | 每次 `Exec` 一次 `Connect` / `Close`；`Result` 可重复调，只等一次 | 子进程后端连接无成本；缓存是远端传输的需要 |
 
@@ -277,6 +284,7 @@ type Error struct {
 	BaseRev    int64
 	CurrentRev int64
 	ExecID     string
+	RuntimeIDs []string // 仅第二阶段 ESYNC_LOST
 	err        error    // 底层原因，可为 nil
 }
 
@@ -284,7 +292,11 @@ func (e *Error) Error() string
 func (e *Error) Unwrap() []error   // 按 Code 返回对应哨兵，让 errors.Is 成立
 ```
 
+字段按 `Code` 解释，其余为零值：`EEXIST` 只看 `Path` / `TargetPath`，`ECONFLICT` 只看 `Path` / `BaseRev` / `CurrentRev`，`EEXEC_LOST` 只看 `ExecID`。调用方按 `Code` 分支，不按字段是否存在分支。
+
 调用方重试的形状：`errors.As` 取 `CurrentRev`，重读文件，用新版本重写。不需要解析字符串。
+
+`rename` 报错时字段指向哪一侧：`Path` 永远是源路径。`EEXIST` 与目标侧 `ECONFLICT` 另带 `TargetPath`，此时 `BaseRev` / `CurrentRev` 描述目标节点。两个前置条件都过期时报源，调用方重读后再遇到目标冲突。
 
 ## 8. 第一阶段明确不做
 
@@ -301,5 +313,7 @@ func (e *Error) Unwrap() []error   // 按 Code 返回对应哨兵，让 errors.I
 | 9 | 内容定义分块 | 固定分块够用 | 出现大量插入型大文件写 |
 | 10 | 后台 GC 守护进程 | 改在 `Close` 时与阈值触发 | 出现长时间常驻工作区 |
 | 11 | Windows 支持 | 进程组与 FUSE 都要分支，成本翻倍 | 明确有需求时 |
+| 12 | `Setattr` 改权限（`chmod`） | 目前只落 `Create` / `Mkdir` 的 `mode`，修改权限没有入口 | 有调用方依赖权限位时 |
+| 13 | `Truncate` 的增量实现 | 现在整文件读出再写回；大文件截断会占满内存 | 出现真实的大文件截断 |
 
 第 7 项与 Q19 的选择绑定：选了续传点，就没有历史可回放。要做快照，先回来改 Q19。

@@ -223,7 +223,7 @@ func (w *Workspace) prune(ctx context.Context) {
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Rev > entries[j].Rev })
 	for _, e := range entries[keepOutput:] {
-		_ = w.store.Remove(ctx, outputDir+"/"+e.Name)
+		_ = w.store.Remove(ctx, outputDir+"/"+e.Name, nil)
 	}
 }
 
@@ -320,13 +320,14 @@ func (w *Workspace) Stat(ctx context.Context, path string) (*vfs.Stat, error) {
 	return w.store.Stat(ctx, path)
 }
 
-// ReadFile returns a file's bytes. See vfs.Store.ReadFile.
-func (w *Workspace) ReadFile(ctx context.Context, path string) ([]byte, error) {
+// ReadFile returns a file's bytes and metadata as one snapshot. See
+// vfs.Store.ReadFile.
+func (w *Workspace) ReadFile(ctx context.Context, path string) (*vfs.Content, error) {
 	return w.store.ReadFile(ctx, path)
 }
 
 // WriteFile creates or replaces a file. See vfs.Store.WriteFile.
-func (w *Workspace) WriteFile(ctx context.Context, path string, data []byte, opts *vfs.WriteOptions) error {
+func (w *Workspace) WriteFile(ctx context.Context, path string, data []byte, opts *vfs.MutateOptions) error {
 	return w.store.WriteFile(ctx, path, data, opts)
 }
 
@@ -336,8 +337,8 @@ func (w *Workspace) ReadDir(ctx context.Context, path string) ([]vfs.Dirent, err
 }
 
 // Mkdir creates one directory. See vfs.Store.Mkdir.
-func (w *Workspace) Mkdir(ctx context.Context, path string) error {
-	return w.store.Mkdir(ctx, path)
+func (w *Workspace) Mkdir(ctx context.Context, path string, opts *vfs.MutateOptions) error {
+	return w.store.Mkdir(ctx, path, opts)
 }
 
 // MkdirAll creates a directory and its parents. See vfs.Store.MkdirAll.
@@ -346,11 +347,17 @@ func (w *Workspace) MkdirAll(ctx context.Context, path string) error {
 }
 
 // Remove deletes a file or an empty directory. See vfs.Store.Remove.
-func (w *Workspace) Remove(ctx context.Context, path string) error {
-	return w.store.Remove(ctx, path)
+func (w *Workspace) Remove(ctx context.Context, path string, opts *vfs.MutateOptions) error {
+	return w.store.Remove(ctx, path, opts)
 }
 
 // Truncate sets a file's length. See vfs.Store.Truncate.
-func (w *Workspace) Truncate(ctx context.Context, path string, size int64) error {
-	return w.store.Truncate(ctx, path, size)
+func (w *Workspace) Truncate(ctx context.Context, path string, size int64, opts *vfs.MutateOptions) error {
+	return w.store.Truncate(ctx, path, size, opts)
+}
+
+// Rename moves a path. See vfs.Store.Rename: it takes two preconditions,
+// BaseRev for the source and TargetBaseRev for the target it replaces.
+func (w *Workspace) Rename(ctx context.Context, src, dst string, opts *vfs.MutateOptions) error {
+	return w.store.Rename(ctx, src, dst, opts)
 }

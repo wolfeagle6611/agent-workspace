@@ -360,7 +360,7 @@ func TestShellOutputLandsInTheStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read back %s: %v", out.Path, err)
 	}
-	if int64(len(full)) != out.Bytes {
-		t.Fatalf("stored %d bytes, counted %d", len(full), out.Bytes)
+	if int64(len(full.Data)) != out.Bytes {
+		t.Fatalf("stored %d bytes, counted %d", len(full.Data), out.Bytes)
 	}
 }

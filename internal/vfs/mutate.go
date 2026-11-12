@@ -32,29 +32,23 @@ func (s *Store) WriteAt(ctx context.Context, path string, off int64, data []byte
 			return err
 		}
 
-		inode, _, err := lookupEntry(ctx, tx, parent, base)
+		node, err := lookupNode(ctx, tx, parent, base)
 		if err != nil {
 			return err
 		}
-
-		var size int64
-		if inode == 0 {
+		var inode, size int64
+		if node == nil {
 			if off != 0 {
 				return newError(CodeNotFound, path)
 			}
-			inode, err = createNode(ctx, tx, parent, base, TypeFile, 0o644, now)
-			if err != nil {
+			if inode, err = createNode(ctx, tx, parent, base, TypeFile, 0o644, now); err != nil {
 				return err
 			}
 		} else {
-			n, err := nodeRow(ctx, tx, inode)
-			if err != nil {
-				return err
-			}
-			if n.Type == TypeDir {
+			if node.Type == TypeDir {
 				return newError(CodeIsDir, path)
 			}
-			size = n.Size
+			inode, size = node.Inode, node.Size
 		}
 
 		rev, err := mintRev(ctx, tx)
@@ -79,7 +73,7 @@ func (s *Store) WriteAt(ctx context.Context, path string, off int64, data []byte
 // Truncate sets a file's length. Growing zero-fills; shrinking drops the tail.
 // This one rewrites the whole chunk list: truncation is rare, and the simple
 // path is easier to keep correct than a partial-chunk special case.
-func (s *Store) Truncate(ctx context.Context, path string, size int64) error {
+func (s *Store) Truncate(ctx context.Context, path string, size int64, opts *MutateOptions) error {
 	clean, err := Clean(path)
 	if err != nil {
 		return err
@@ -91,6 +85,7 @@ func (s *Store) Truncate(ctx context.Context, path string, size int64) error {
 		return newError(CodeIsDir, path)
 	}
 	dir, base := parentOf(clean)
+	want := opts.baseRev()
 	now := s.lastSeen()
 
 	return s.withWrite(ctx, func(ctx context.Context, tx *sql.Tx) error {
@@ -98,18 +93,21 @@ func (s *Store) Truncate(ctx context.Context, path string, size int64) error {
 		if err != nil {
 			return notFoundPath(err, path)
 		}
-		inode, err := childInode(ctx, tx, parent, base)
-		if err != nil {
-			return notFoundPath(err, path)
+		if err := requireDir(ctx, tx, parent, dir); err != nil {
+			return err
 		}
-		n, err := nodeRow(ctx, tx, inode)
+		node, err := requireNode(ctx, tx, parent, base, path)
 		if err != nil {
 			return err
 		}
-		if n.Type == TypeDir {
+		if node.Type == TypeDir {
 			return newError(CodeIsDir, path)
 		}
+		if err := checkBaseRev(clean, want, node); err != nil {
+			return err
+		}
 
+		inode := node.Inode
 		body, err := chunks.Bytes(ctx, tx, inode)
 		if err != nil {
 			return err
@@ -143,7 +141,7 @@ func (s *Store) Truncate(ctx context.Context, path string, size int64) error {
 }
 
 // Remove deletes a file or an empty directory.
-func (s *Store) Remove(ctx context.Context, path string) error {
+func (s *Store) Remove(ctx context.Context, path string, opts *MutateOptions) error {
 	clean, err := Clean(path)
 	if err != nil {
 		return err
@@ -152,31 +150,33 @@ func (s *Store) Remove(ctx context.Context, path string) error {
 		return newError(CodePerm, path)
 	}
 	dir, base := parentOf(clean)
+	want := opts.baseRev()
 
 	return s.withWrite(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		parent, err := resolveInode(ctx, tx, dir)
 		if err != nil {
 			return notFoundPath(err, path)
 		}
-		inode, err := childInode(ctx, tx, parent, base)
-		if err != nil {
-			return notFoundPath(err, path)
+		if err := requireDir(ctx, tx, parent, dir); err != nil {
+			return err
 		}
-		n, err := nodeRow(ctx, tx, inode)
+		node, err := requireNode(ctx, tx, parent, base, path)
 		if err != nil {
 			return err
 		}
-		if n.Type == TypeDir {
-			var children int
-			if err := tx.QueryRowContext(ctx,
-				`SELECT COUNT(*) FROM vfs_dirents WHERE parent_inode = ?`, inode,
-			).Scan(&children); err != nil {
-				return wrapError(CodeInvalid, path, err)
+		if node.Type == TypeDir {
+			empty, err := dirEmpty(ctx, tx, node.Inode)
+			if err != nil {
+				return err
 			}
-			if children > 0 {
+			if !empty {
 				return newError(CodeNotEmpty, path)
 			}
 		}
+		if err := checkBaseRev(clean, want, node); err != nil {
+			return err
+		}
+		inode := node.Inode
 
 		if _, err := mintRev(ctx, tx); err != nil {
 			return err

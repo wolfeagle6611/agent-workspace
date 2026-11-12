@@ -42,8 +42,8 @@ func TestExecWritesThroughTheMount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read back: %v", err)
 	}
-	if string(got) != "hi" {
-		t.Fatalf("f = %q, want hi", got)
+	if string(got.Data) != "hi" {
+		t.Fatalf("f = %q, want hi", got.Data)
 	}
 	st, err := w.Stat(ctx, "/sub/f")
 	if err != nil {
@@ -61,7 +61,7 @@ func TestExecWritesThroughTheMount(t *testing.T) {
 	if _, err := ex.Result(ctx); err != nil {
 		t.Fatalf("second result: %v", err)
 	}
-	if got, err := w.ReadFile(ctx, "/copy"); err != nil || string(got) != "hi" {
+	if got, err := w.ReadFile(ctx, "/copy"); err != nil || string(got.Data) != "hi" {
 		t.Fatalf("copy = %q (%v), want hi", got, err)
 	}
 

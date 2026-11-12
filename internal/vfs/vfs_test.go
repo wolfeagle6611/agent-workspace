@@ -35,8 +35,8 @@ func TestWriteReadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("got %q, want %q", got, want)
+	if !bytes.Equal(got.Data, want) {
+		t.Fatalf("got %q, want %q", got.Data, want)
 	}
 
 	st, err := s.Stat(ctx, "/workspace/notes/todo.md")
@@ -77,8 +77,8 @@ func TestPersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read after reopen: %v", err)
 	}
-	if string(got) != "survives" {
-		t.Fatalf("got %q", got)
+	if string(got.Data) != "survives" {
+		t.Fatalf("got %q", got.Data)
 	}
 }
 
@@ -174,8 +174,8 @@ func TestChunkingAndDedupe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if !bytes.Equal(got, big) {
-		t.Fatalf("round trip mismatch: %d bytes", len(got))
+	if !bytes.Equal(got.Data, big) {
+		t.Fatalf("round trip mismatch: %d bytes", len(got.Data))
 	}
 }
 
@@ -201,8 +201,8 @@ func TestEmptyFileHasNoChunks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if len(got) != 0 {
-		t.Fatalf("got %d bytes", len(got))
+	if len(got.Data) != 0 {
+		t.Fatalf("got %d bytes", len(got.Data))
 	}
 }
 
@@ -271,7 +271,7 @@ func TestBaseRevConflictAndRetry(t *testing.T) {
 	}
 
 	stale := read.Rev
-	err = s.WriteFile(ctx, "/counter.txt", []byte("7"), &WriteOptions{BaseRev: &stale})
+	err = s.WriteFile(ctx, "/counter.txt", []byte("7"), &MutateOptions{BaseRev: &stale})
 	if !errors.Is(err, ErrConflict) {
 		t.Fatalf("want ErrConflict, got %v", err)
 	}
@@ -285,12 +285,12 @@ func TestBaseRevConflictAndRetry(t *testing.T) {
 
 	// Re-read and retry with the current revision.
 	fresh := fe.CurrentRev
-	if err = s.WriteFile(ctx, "/counter.txt", []byte("7"), &WriteOptions{BaseRev: &fresh}); err != nil {
+	if err = s.WriteFile(ctx, "/counter.txt", []byte("7"), &MutateOptions{BaseRev: &fresh}); err != nil {
 		t.Fatalf("retry: %v", err)
 	}
 	got, _ := s.ReadFile(ctx, "/counter.txt")
-	if string(got) != "7" {
-		t.Fatalf("got %q", got)
+	if string(got.Data) != "7" {
+		t.Fatalf("got %q", got.Data)
 	}
 }
 
@@ -299,10 +299,10 @@ func TestBaseRevZeroMeansExpectAbsent(t *testing.T) {
 	s := newStore(t)
 
 	zero := int64(0)
-	if err := s.WriteFile(ctx, "/new.txt", []byte("a"), &WriteOptions{BaseRev: &zero}); err != nil {
+	if err := s.WriteFile(ctx, "/new.txt", []byte("a"), &MutateOptions{BaseRev: &zero}); err != nil {
 		t.Fatalf("create with base 0: %v", err)
 	}
-	err := s.WriteFile(ctx, "/new.txt", []byte("b"), &WriteOptions{BaseRev: &zero})
+	err := s.WriteFile(ctx, "/new.txt", []byte("b"), &MutateOptions{BaseRev: &zero})
 	if !errors.Is(err, ErrConflict) {
 		t.Fatalf("second create with base 0 = %v, want ErrConflict", err)
 	}
@@ -313,27 +313,27 @@ func TestBaseRevOnAbsentWithNonZeroRev(t *testing.T) {
 	s := newStore(t)
 
 	nine := int64(9)
-	err := s.WriteFile(ctx, "/ghost", []byte("a"), &WriteOptions{BaseRev: &nine})
+	err := s.WriteFile(ctx, "/ghost", []byte("a"), &MutateOptions{BaseRev: &nine})
 	if !errors.Is(err, ErrConflict) {
 		t.Fatalf("want ErrConflict, got %v", err)
 	}
 }
 
-func TestMkdirIdempotentAndMkdirAll(t *testing.T) {
+func TestMkdirStrictAndMkdirAll(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
 
 	if err := s.MkdirAll(ctx, "/a/b/c"); err != nil {
 		t.Fatalf("mkdirall: %v", err)
 	}
-	if err := s.Mkdir(ctx, "/a/b/c"); err != nil {
-		t.Fatalf("mkdir existing dir must be idempotent: %v", err)
+	if err := s.Mkdir(ctx, "/a/b/c", nil); !errors.Is(err, ErrExist) {
+		t.Fatalf("mkdir on existing dir = %v, want ErrExist", err)
 	}
 	if err := s.MkdirAll(ctx, "/a/b/c"); err != nil {
 		t.Fatalf("mkdirall idempotent: %v", err)
 	}
 
-	if err := s.Mkdir(ctx, "/a/b/c/d"); err != nil {
+	if err := s.Mkdir(ctx, "/a/b/c/d", nil); err != nil {
 		t.Fatalf("mkdir child: %v", err)
 	}
 
@@ -341,8 +341,8 @@ func TestMkdirIdempotentAndMkdirAll(t *testing.T) {
 	if err := s.WriteFile(ctx, "/a/file", []byte("x"), nil); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if err := s.Mkdir(ctx, "/a/file"); !errors.Is(err, ErrNotDir) {
-		t.Fatalf("mkdir over file = %v, want ErrNotDir", err)
+	if err := s.Mkdir(ctx, "/a/file", nil); !errors.Is(err, ErrExist) {
+		t.Fatalf("mkdir over file = %v, want ErrExist", err)
 	}
 }
 
@@ -384,8 +384,8 @@ func TestConcurrentWritesAreSerialized(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", path, err)
 		}
-		if want := fmt.Sprintf("body-%d", i); string(got) != want {
-			t.Fatalf("%s = %q, want %q", path, got, want)
+		if want := fmt.Sprintf("body-%d", i); string(got.Data) != want {
+			t.Fatalf("%s = %q, want %q", path, got.Data, want)
 		}
 	}
 }

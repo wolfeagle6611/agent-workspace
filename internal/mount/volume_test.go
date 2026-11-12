@@ -20,11 +20,49 @@ func newVolume(t *testing.T) (*Volume, *vfs.Store) {
 	return NewVolume(s), s
 }
 
+// TestVolumePassesMode pins the wiring: the permission bits the kernel hands
+// to create() and mkdir() reach the node, so stat() does not report a lie.
+func TestVolumePassesMode(t *testing.T) {
+	ctx := context.Background()
+	vol, store := newVolume(t)
+
+	if _, err := vol.Create(ctx, "/p.txt", 0o600); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := vol.Mkdir(ctx, "/private", 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	for path, want := range map[string]uint32{"/p.txt": 0o600, "/private": 0o700} {
+		st, err := store.Stat(ctx, path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		if st.Mode != want {
+			t.Fatalf("%s mode %#o, want %#o", path, st.Mode, want)
+		}
+	}
+
+	// A create without a mode keeps the mode the file already had.
+	if err := vol.Truncate(ctx, "/p.txt", 0); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if _, err := vol.Create(ctx, "/p.txt", 0); err != nil {
+		t.Fatalf("re-create: %v", err)
+	}
+	st, err := store.Stat(ctx, "/p.txt")
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if st.Mode != 0o600 {
+		t.Fatalf("mode reset to %#o on replace, want it kept at 0600", st.Mode)
+	}
+}
+
 func TestVolumeWriteFlushRead(t *testing.T) {
 	ctx := context.Background()
 	vol, _ := newVolume(t)
 
-	h, err := vol.Create(ctx, "/hello.txt")
+	h, err := vol.Create(ctx, "/hello.txt", 0o644)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -54,7 +92,7 @@ func TestVolumeReadSeesUnflushedWrite(t *testing.T) {
 	ctx := context.Background()
 	vol, _ := newVolume(t)
 
-	h, err := vol.Create(ctx, "/live.txt")
+	h, err := vol.Create(ctx, "/live.txt", 0o644)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -75,7 +113,7 @@ func TestVolumeFlushesAtChunkBoundary(t *testing.T) {
 	ctx := context.Background()
 	vol, store := newVolume(t)
 
-	h, err := vol.Create(ctx, "/big.bin")
+	h, err := vol.Create(ctx, "/big.bin", 0o644)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -106,8 +144,8 @@ func TestVolumeFlushesAtChunkBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if !bytes.Equal(body[len(body)-4:], []byte("tail")) {
-		t.Fatalf("tail missing: %q", body[len(body)-4:])
+	if !bytes.Equal(body.Data[len(body.Data)-4:], []byte("tail")) {
+		t.Fatalf("tail missing: %q", body.Data[len(body.Data)-4:])
 	}
 }
 
@@ -131,7 +169,7 @@ func TestVolumeReleaseFlushesWithoutExplicitFlush(t *testing.T) {
 	ctx := context.Background()
 	vol, store := newVolume(t)
 
-	h, err := vol.Create(ctx, "/tail.txt")
+	h, err := vol.Create(ctx, "/tail.txt", 0o644)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -145,8 +183,8 @@ func TestVolumeReleaseFlushesWithoutExplicitFlush(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if string(got) != "kept" {
-		t.Fatalf("got %q", got)
+	if string(got.Data) != "kept" {
+		t.Fatalf("got %q", got.Data)
 	}
 }
 
@@ -154,10 +192,10 @@ func TestVolumeDirectoryOps(t *testing.T) {
 	ctx := context.Background()
 	vol, _ := newVolume(t)
 
-	if err := vol.Mkdir(ctx, "/dir"); err != nil {
+	if err := vol.Mkdir(ctx, "/dir", 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	h, err := vol.Create(ctx, "/dir/file")
+	h, err := vol.Create(ctx, "/dir/file", 0o644)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -217,11 +255,11 @@ func TestVolumeCloseFlushesEveryHandle(t *testing.T) {
 	ctx := context.Background()
 	vol, store := newVolume(t)
 
-	first, err := vol.Create(ctx, "/one")
+	first, err := vol.Create(ctx, "/one", 0o644)
 	if err != nil {
 		t.Fatalf("create one: %v", err)
 	}
-	second, err := vol.Create(ctx, "/two")
+	second, err := vol.Create(ctx, "/two", 0o644)
 	if err != nil {
 		t.Fatalf("create two: %v", err)
 	}
@@ -241,8 +279,8 @@ func TestVolumeCloseFlushesEveryHandle(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", path, err)
 		}
-		if string(got) != want {
-			t.Fatalf("%s = %q, want %q", path, got, want)
+		if string(got.Data) != want {
+			t.Fatalf("%s = %q, want %q", path, got.Data, want)
 		}
 	}
 	if vol.OpenHandles() != 0 {
@@ -257,7 +295,7 @@ func TestVolumeRefusesWriteToHandleItClosed(t *testing.T) {
 	ctx := context.Background()
 	vol, _ := newVolume(t)
 
-	id, err := vol.Create(ctx, "/late.txt")
+	id, err := vol.Create(ctx, "/late.txt", 0o644)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}

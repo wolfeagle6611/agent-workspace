@@ -49,13 +49,28 @@ var (
 
 // Error is the structured form. Callers use errors.As to reach Path,
 // BaseRev, and CurrentRev, then retry against CurrentRev.
+//
+// Code decides which fields carry meaning; every other field stays zero.
+// Read the fields by Code, never by presence:
+//
+//	ENOENT, ENOTDIR, EISDIR, ENOTEMPTY, EROFS, EINVAL, EPERM  Path
+//	EEXIST                                                  Path, TargetPath
+//	ECONFLICT                                               Path, BaseRev, CurrentRev
+//	ENOBACKEND                                              Path (the id)
+//	EEXEC_LOST                                              ExecID
+//	ESYNC_LOST                                              RuntimeIDs (phase two)
+//
+// A rename reports the source in Path. When the error names the target, it
+// also sets TargetPath, and BaseRev / CurrentRev describe the target node
+// (go-mapping §7).
 type Error struct {
 	Code       string
 	Path       string
-	TargetPath string // rename only
+	TargetPath string // rename only: the target this error names
 	BaseRev    int64
 	CurrentRev int64
 	ExecID     string
+	RuntimeIDs []string
 	Err        error // cause, may be nil
 }
 

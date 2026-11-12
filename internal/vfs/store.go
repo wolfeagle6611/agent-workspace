@@ -104,6 +104,11 @@ func (s *Store) exec(op writeOp) error {
 }
 
 // withWrite queues fn on the writer goroutine.
+//
+// ctx bounds the wait, not the write: once fn is queued it commits even if
+// the caller has gone away, and the caller gets ctx.Err() as if the write
+// failed. A caller that retries with the same precondition therefore gets
+// ECONFLICT rather than a second write, so nothing lands twice.
 func (s *Store) withWrite(ctx context.Context, fn func(context.Context, *sql.Tx) error) error {
 	op := writeOp{fn: fn, done: make(chan error, 1)}
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"gitlab.webullbroker.com/webull-go/agent-design/internal/runtime"
@@ -37,8 +38,8 @@ func TestFsForwarding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if string(got) != "hello" {
-		t.Fatalf("read %q, want hello", got)
+	if string(got.Data) != "hello" {
+		t.Fatalf("read %q, want hello", got.Data)
 	}
 	st, err := w.Stat(ctx, "/a/b/f.txt")
 	if err != nil {
@@ -54,10 +55,10 @@ func TestFsForwarding(t *testing.T) {
 	if len(entries) != 1 || entries[0].Name != "f.txt" {
 		t.Fatalf("entries %+v", entries)
 	}
-	if err := w.Truncate(ctx, "/a/b/f.txt", 2); err != nil {
+	if err := w.Truncate(ctx, "/a/b/f.txt", 2, nil); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
-	if err := w.Remove(ctx, "/a/b/f.txt"); err != nil {
+	if err := w.Remove(ctx, "/a/b/f.txt", nil); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
 }
@@ -209,8 +210,8 @@ func TestOutputStoresTheWholeText(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read full text: %v", err)
 	}
-	if len(full) != total || res.Stdout.Bytes != int64(total) {
-		t.Fatalf("stored %d bytes, counted %d, want %d", len(full), res.Stdout.Bytes, total)
+	if len(full.Data) != total || res.Stdout.Bytes != int64(total) {
+		t.Fatalf("stored %d bytes, counted %d, want %d", len(full.Data), res.Stdout.Bytes, total)
 	}
 	if len(res.Stdout.Tail) > 64<<10 {
 		t.Fatalf("tail is %d bytes, want a bounded window", len(res.Stdout.Tail))
@@ -246,4 +247,103 @@ func TestPruneKeepsFifty(t *testing.T) {
 	if _, err := w.Stat(ctx, "/.computer/output/run-0.stdout.log"); !errors.Is(err, vfs.ErrNotFound) {
 		t.Fatalf("oldest file survived: %v", err)
 	}
+}
+
+// TestConcurrentReadModifyWrite is the acceptance check for go-mapping §5
+// step 5: two writers read one revision, both write, exactly one wins and the
+// loser gets a structured conflict it can retry from.
+func TestConcurrentReadModifyWrite(t *testing.T) {
+	ctx := context.Background()
+	w := open(t)
+
+	if err := w.WriteFile(ctx, "/counter", []byte("0"), nil); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	c, err := w.ReadFile(ctx, "/counter")
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	base := c.Stat.Rev
+
+	var wg sync.WaitGroup
+	type outcome struct {
+		body string
+		err  error
+	}
+	results := make(chan outcome, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rev := base
+			body := fmt.Sprintf("%d", i+1)
+			err := w.WriteFile(ctx, "/counter", []byte(body), &vfs.MutateOptions{BaseRev: &rev})
+			results <- outcome{body: body, err: err}
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+
+	var winner string
+	var conflicts int
+	for res := range results {
+		switch {
+		case res.err == nil:
+			winner = res.body
+		case errors.Is(res.err, vfs.ErrConflict):
+			conflicts++
+			var fe *vfs.Error
+			if !errors.As(res.err, &fe) {
+				t.Fatalf("conflict is not a *vfs.Error: %T", res.err)
+			}
+			if fe.CurrentRev <= base {
+				t.Fatalf("conflict current rev %d, want > %d", fe.CurrentRev, base)
+			}
+		default:
+			t.Fatalf("unexpected error: %v", res.err)
+		}
+	}
+	if winner == "" || conflicts != 1 {
+		t.Fatalf("winner %q, %d conflicts; want one winner and one conflict", winner, conflicts)
+	}
+	got, err := w.ReadFile(ctx, "/counter")
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(got.Data) != winner {
+		t.Fatalf("stored %q, winner wrote %q", got.Data, winner)
+	}
+}
+
+func TestRenameForwarding(t *testing.T) {
+	ctx := context.Background()
+	w := open(t)
+
+	if err := w.WriteFile(ctx, "/a", []byte("body"), nil); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	stale := staleRev(t, w, "/a")
+	if err := w.Rename(ctx, "/a", "/b", &vfs.MutateOptions{BaseRev: &stale}); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	got, err := w.ReadFile(ctx, "/b")
+	if err != nil {
+		t.Fatalf("read moved file: %v", err)
+	}
+	if string(got.Data) != "body" {
+		t.Fatalf("moved file holds %q", got.Data)
+	}
+	// The pre-rename revision no longer names this path.
+	if err := w.WriteFile(ctx, "/b", []byte("x"), &vfs.MutateOptions{BaseRev: &stale}); !errors.Is(err, vfs.ErrConflict) {
+		t.Fatalf("write with pre-rename rev = %v, want ErrConflict", err)
+	}
+}
+
+func staleRev(t *testing.T, w *Workspace, path string) int64 {
+	t.Helper()
+	st, err := w.Stat(context.Background(), path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return st.Rev
 }

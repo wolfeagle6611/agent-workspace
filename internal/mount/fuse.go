@@ -109,7 +109,7 @@ func (n *node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 
 func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	path := n.join(name)
-	if err := n.vol.Mkdir(ctx, path); err != nil {
+	if err := n.vol.Mkdir(ctx, path, mode&0o7777); err != nil {
 		return nil, errno(err)
 	}
 	st, err := n.vol.Lookup(ctx, path)
@@ -123,7 +123,7 @@ func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.En
 
 func (n *node) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	path := n.join(name)
-	id, err := n.vol.Create(ctx, path)
+	id, err := n.vol.Create(ctx, path, mode&0o7777)
 	if err != nil {
 		return nil, nil, 0, errno(err)
 	}
@@ -152,7 +152,7 @@ func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		err error
 	)
 	if flags&syscall.O_TRUNC != 0 && writable {
-		id, err = n.vol.Create(ctx, n.path)
+		id, err = n.vol.Create(ctx, n.path, 0)
 	} else {
 		id, err = n.vol.Open(ctx, n.path, writable)
 	}
