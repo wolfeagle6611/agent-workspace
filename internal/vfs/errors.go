@@ -9,36 +9,42 @@ import (
 // logs and tests read the same across both systems. ECONFLICT is ours: the
 // upstream system has no baseRev.
 // See docs/architecture/go-mapping.md §7.
+//
+// The execution surface (internal/workspace, internal/runtime) reports the
+// same codes through the same type, so callers use errors.As once. This
+// package is where the codes live today, not where all of them belong.
 const (
-	CodeNotFound = "ENOENT"
-	CodeExist    = "EEXIST"
-	CodeNotDir   = "ENOTDIR"
-	CodeIsDir    = "EISDIR"
-	CodeNotEmpty = "ENOTEMPTY"
-	CodeReadOnly = "EROFS"
-	CodeInvalid  = "EINVAL"
-	CodePerm     = "EPERM"
-	CodeConflict = "ECONFLICT"
-	CodeExecLost = "EEXEC_LOST"
-	CodeSyncLost = "ESYNC_LOST"
-	CodeClosed   = "ECLOSED"
+	CodeNotFound  = "ENOENT"
+	CodeNoBackend = "ENOBACKEND"
+	CodeExist     = "EEXIST"
+	CodeNotDir    = "ENOTDIR"
+	CodeIsDir     = "EISDIR"
+	CodeNotEmpty  = "ENOTEMPTY"
+	CodeReadOnly  = "EROFS"
+	CodeInvalid   = "EINVAL"
+	CodePerm      = "EPERM"
+	CodeConflict  = "ECONFLICT"
+	CodeExecLost  = "EEXEC_LOST"
+	CodeSyncLost  = "ESYNC_LOST"
+	CodeClosed    = "ECLOSED"
 )
 
 // Sentinels exist so callers can write errors.Is(err, vfs.ErrConflict)
 // without parsing strings.
 var (
-	ErrNotFound = errors.New("not found")
-	ErrExist    = errors.New("already exists")
-	ErrNotDir   = errors.New("not a directory")
-	ErrIsDir    = errors.New("is a directory")
-	ErrNotEmpty = errors.New("directory not empty")
-	ErrReadOnly = errors.New("read-only")
-	ErrInvalid  = errors.New("invalid argument")
-	ErrPerm     = errors.New("operation not permitted")
-	ErrConflict = errors.New("version conflict")
-	ErrExecLost = errors.New("execution lost")
-	ErrSyncLost = errors.New("sync lost")
-	ErrClosed   = errors.New("store closed")
+	ErrNotFound  = errors.New("not found")
+	ErrExist     = errors.New("already exists")
+	ErrNotDir    = errors.New("not a directory")
+	ErrIsDir     = errors.New("is a directory")
+	ErrNotEmpty  = errors.New("directory not empty")
+	ErrReadOnly  = errors.New("read-only")
+	ErrInvalid   = errors.New("invalid argument")
+	ErrNoBackend = errors.New("unknown backend")
+	ErrPerm      = errors.New("operation not permitted")
+	ErrConflict  = errors.New("version conflict")
+	ErrExecLost  = errors.New("execution lost")
+	ErrSyncLost  = errors.New("sync lost")
+	ErrClosed    = errors.New("store closed")
 )
 
 // Error is the structured form. Callers use errors.As to reach Path,
@@ -97,6 +103,8 @@ func sentinelFor(code string) error {
 		return ErrReadOnly
 	case CodeInvalid:
 		return ErrInvalid
+	case CodeNoBackend:
+		return ErrNoBackend
 	case CodePerm:
 		return ErrPerm
 	case CodeConflict:
@@ -113,9 +121,20 @@ func sentinelFor(code string) error {
 }
 
 func newError(code, path string) *Error {
-	return &Error{Code: code, Path: path}
+	return NewError(code, path)
 }
 
 func wrapError(code, path string, err error) *Error {
+	return WrapError(code, path, err)
+}
+
+// NewError builds a coded error without a cause. It is exported because the
+// execution surface reports the same codes to the same callers.
+func NewError(code, path string) *Error {
+	return &Error{Code: code, Path: path}
+}
+
+// WrapError builds a coded error that keeps err reachable through Unwrap.
+func WrapError(code, path string, err error) *Error {
 	return &Error{Code: code, Path: path, Err: err}
 }

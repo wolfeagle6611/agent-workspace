@@ -212,3 +212,69 @@ func TestVolumeUnknownHandle(t *testing.T) {
 		t.Fatalf("release of unknown handle = %v, want nil", err)
 	}
 }
+
+func TestVolumeCloseFlushesEveryHandle(t *testing.T) {
+	ctx := context.Background()
+	vol, store := newVolume(t)
+
+	first, err := vol.Create(ctx, "/one")
+	if err != nil {
+		t.Fatalf("create one: %v", err)
+	}
+	second, err := vol.Create(ctx, "/two")
+	if err != nil {
+		t.Fatalf("create two: %v", err)
+	}
+	// Neither handle flushes: Close must commit both, in any order.
+	if _, err := vol.Write(ctx, first, 0, []byte("1")); err != nil {
+		t.Fatalf("write one: %v", err)
+	}
+	if _, err := vol.Write(ctx, second, 0, []byte("2")); err != nil {
+		t.Fatalf("write two: %v", err)
+	}
+
+	if err := vol.Close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	for path, want := range map[string]string{"/one": "1", "/two": "2"} {
+		got, err := store.ReadFile(ctx, path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if string(got) != want {
+			t.Fatalf("%s = %q, want %q", path, got, want)
+		}
+	}
+	if vol.OpenHandles() != 0 {
+		t.Fatalf("handles kept after close: %d", vol.OpenHandles())
+	}
+	if _, err := vol.Write(ctx, first, 0, []byte("x")); !errors.Is(err, ErrBadHandle) {
+		t.Fatalf("write after close = %v, want ErrBadHandle", err)
+	}
+}
+
+func TestVolumeRefusesWriteToHandleItClosed(t *testing.T) {
+	ctx := context.Background()
+	vol, _ := newVolume(t)
+
+	id, err := vol.Create(ctx, "/late.txt")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// A write that resolved the handle before Close holds this pointer. The
+	// close lands between the lookup and the lock, so replay that order: the
+	// write must fail loudly, not vanish into a buffer nobody flushes.
+	held, err := vol.handle(id)
+	if err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	if err := vol.Close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	held.mu.Lock()
+	defer held.mu.Unlock()
+	if _, err := vol.writeLocked(ctx, held, 0, []byte("x")); !errors.Is(err, ErrBadHandle) {
+		t.Fatalf("write after close = %v, want ErrBadHandle", err)
+	}
+}

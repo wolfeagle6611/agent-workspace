@@ -231,6 +231,13 @@ func (w *Workspace) execContainer(ctx context.Context, cmd string, opts ExecOpti
 | 执行记录 | 落库 `exec_id / 命令 / 起止时间 / 状态`；重启后查旧 id 返回 `ErrExecLost`，不是“未知 id” | 区分“丢失”与“不存在”是两种事实 |
 | 输出全文 | 放工作区 `/.computer/output`，保留最近 50 个，路径写进结果 | 与上游路径一致，读取复用现有 `fs` API |
 | 保留路径 | `/.computer` 是系统目录：`readdir("/")` 仍列出它，但备份、`git status`、变更报告默认忽略；不允许在此建立挂载点 | 打破“根下不自动创建”的例外必须显式登记 |
+| 挂载时机 | `mount.Session` 独占挂载协议：`Mount` 惰性且单飞，`Unmount` 顺序为冲缓冲 → 卸载 → 删目录；`Workspace.Close` 只加关库 | 顺序写错就丢缓冲；协议住在挂载包里，调用方无处写错 |
+| 挂载点命名 | `<挂载根>/<数据库文件名去扩展名>-<绝对路径哈希前 8 位>` | `Prepare` 会清掉挂载点上的占用者，同名数据库共用挂载点会卸载活工作区并串库 |
+| exec 可见性 | 子进程 `close()` 后可见；未关的写入最多 512 KiB 不可见 | 沿用 FUSE 缓冲规则，不为此改 `Volume` |
+| exec 命令形状 | `/bin/sh -c`；环境 = 进程环境加 `ExecOptions.Env`；stdin 为空设备 | 上游 `source` 是 shell 命令；继承环境让 `git` / `go` 可用；读 stdin 不会挂死 |
+| exec 取消（第 3 步） | `ctx` 取消 → 杀直接子进程 → `Status Cancelled` 加 `ctx.Err()`；进程组与 5 秒宽限留给第 4 步 | 第 4 步才做进程组，先让“取消”有定义 |
+| backend 路由 | `ExecOptions.Backend` 空串 = 唯一注册的后端；多个后端加空串 = `EINVAL`；未注册 id = `ENOBACKEND` | 空串猜错后端比报错更糟 |
+| 执行句柄 | 每次 `Exec` 一次 `Connect` / `Close`；`Result` 可重复调，只等一次 | 子进程后端连接无成本；缓存是远端传输的需要 |
 
 ## 7. 错误模型
 
@@ -246,6 +253,7 @@ func (w *Workspace) execContainer(ctx context.Context, cmd string, opts ExecOpti
 | `EROFS` | 写保留路径或只读区 | `Path` |
 | `EINVAL` | 相对路径、含 `..` 越界、路径非绝对 | `Path` |
 | `ECONFLICT` | `baseRev` 与当前版本不匹配 | `Path`, `BaseRev`, `CurrentRev` |
+| `ENOBACKEND` | `ExecOptions.Backend` 未注册 | `Path`（该 id） |
 | `EEXEC_LOST` | 执行 id 属于已消失的进程 | `ExecID` |
 | `ESYNC_LOST` | 第二阶段：同步对端被替换 | `RuntimeIDs` |
 
@@ -257,7 +265,7 @@ var (
 	ErrExecLost = errors.New("execution lost")
 )
 
-type FsError struct {
+type Error struct {
 	Code       string   // ENOENT / ECONFLICT / ...
 	Path       string
 	TargetPath string   // 仅 rename
@@ -267,8 +275,8 @@ type FsError struct {
 	err        error    // 底层原因，可为 nil
 }
 
-func (e *FsError) Error() string
-func (e *FsError) Unwrap() error   // 按 Code 返回对应哨兵，让 errors.Is 成立
+func (e *Error) Error() string
+func (e *Error) Unwrap() []error   // 按 Code 返回对应哨兵，让 errors.Is 成立
 ```
 
 调用方重试的形状：`errors.As` 取 `CurrentRev`，重读文件，用新版本重写。不需要解析字符串。

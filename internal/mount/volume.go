@@ -30,6 +30,7 @@ type handle struct {
 	mu       sync.Mutex
 	path     string
 	writable bool
+	closed   bool
 	off      int64
 	buf      []byte
 }
@@ -90,6 +91,16 @@ func (v *Volume) Write(ctx context.Context, id uint64, off int64, data []byte) (
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	return v.writeLocked(ctx, h, off, data)
+}
+
+// writeLocked buffers data on a handle the caller already holds. A handle
+// closed since the lookup refuses the write: buffering it would lose the
+// bytes silently, because nothing flushes that handle any more.
+func (v *Volume) writeLocked(ctx context.Context, h *handle, off int64, data []byte) (int, error) {
+	if h.closed {
+		return 0, ErrBadHandle
+	}
 	if !h.writable {
 		return 0, vfs.ErrReadOnly
 	}
@@ -123,7 +134,9 @@ func (v *Volume) Flush(ctx context.Context, id uint64) error {
 	return v.flushLocked(ctx, h)
 }
 
-// Release flushes and forgets the handle.
+// Release flushes and forgets the handle. A write that already holds the
+// handle sees closed and refuses, so no byte lands in a buffer nobody
+// flushes.
 func (v *Volume) Release(ctx context.Context, id uint64) error {
 	v.mu.Lock()
 	h, ok := v.handles[id]
@@ -134,7 +147,35 @@ func (v *Volume) Release(ctx context.Context, id uint64) error {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.closed = true
 	return v.flushLocked(ctx, h)
+}
+
+// Close flushes every open handle and forgets them all.
+//
+// It returns the joined flush errors and clears the table either way: Close
+// means no further write arrives, so keeping a handle would only delay the
+// loss to a moment nobody watches.
+func (v *Volume) Close(ctx context.Context) error {
+	v.mu.Lock()
+	handles := make([]*handle, 0, len(v.handles))
+	for _, h := range v.handles {
+		handles = append(handles, h)
+	}
+	v.handles = make(map[uint64]*handle)
+	v.mu.Unlock()
+
+	var errs []error
+	for _, h := range handles {
+		h.mu.Lock()
+		h.closed = true
+		err := v.flushLocked(ctx, h)
+		h.mu.Unlock()
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (v *Volume) flushLocked(ctx context.Context, h *handle) error {
