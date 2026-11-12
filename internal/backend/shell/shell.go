@@ -9,7 +9,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"sort"
@@ -45,6 +44,10 @@ func (b *Backend) ID() string { return "shell" }
 // Kind is for diagnostics only.
 func (b *Backend) Kind() string { return "subprocess" }
 
+// Local reports that this backend runs on the host that owns the store, so it
+// needs a real path under the mount point.
+func (b *Backend) Local() bool { return true }
+
 // Connect returns a handle. A subprocess backend needs no handshake.
 func (b *Backend) Connect(ctx context.Context, host runtime.Host) (runtime.Handle, error) {
 	return &handle{grace: b.grace()}, nil
@@ -63,6 +66,12 @@ func (h *handle) Sync() runtime.SyncMode { return runtime.SyncNone }
 // Close is a no-op. The handle owns nothing, and Result reaps the process.
 func (h *handle) Close() error { return nil }
 
+// Closed never fires: a subprocess handle has no connection to lose.
+func (h *handle) Closed() <-chan struct{} { return neverClosed }
+
+// neverClosed is the channel a connectionless handle reports.
+var neverClosed = make(chan struct{})
+
 // Exec starts /bin/sh -c source in req.Dir.
 //
 // The environment is the process environment plus req.Env, stdin is the null
@@ -74,11 +83,9 @@ func (h *handle) Exec(ctx context.Context, req runtime.Request) (*runtime.Exec, 
 	cmd.Dir = req.Dir
 	cmd.Env = environ(req.Env)
 	cmd.Stdin = nil
-	stdout, stderr := io.Discard, io.Discard
-	if req.Output != nil {
-		stdout, stderr = req.Output.Stdout(), req.Output.Stderr()
-	}
-	cmd.Stdout, cmd.Stderr = stdout, stderr
+	// Output is never nil: Runtime allocates it before the start (go-mapping
+	// §3.2). A backend that second-guesses this hides a wiring bug.
+	cmd.Stdout, cmd.Stderr = req.Output.Stdout(), req.Output.Stderr()
 	startGroup(cmd)
 
 	if err := cmd.Start(); err != nil {

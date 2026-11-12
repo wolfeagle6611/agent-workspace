@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,19 +42,26 @@ func (o *outputs) For(ctx context.Context, backendID, execID string) runtime.Out
 
 // handle is a backend that answers with whatever the test says.
 type handle struct {
-	mode   runtime.SyncMode
-	result runtime.Result
-	stdout string
-	calls  int
-	closed int
-	seen   []runtime.Request
+	mode    runtime.SyncMode
+	result  runtime.Result
+	stdout  string
+	calls   int
+	closed  int
+	seen    []runtime.Request
+	dead    chan struct{}
+	execErr error
+	active  int
+	max     int
 }
 
 func (h *handle) Sync() runtime.SyncMode { return h.mode }
 
+// Closed fires only when a test kills the handle.
+func (h *handle) Closed() <-chan struct{} { return h.dead }
+
 // newHandle builds a fake handle. It declares SyncNone, the phase-one mode.
 func newHandle(results ...runtime.Result) *handle {
-	h := &handle{mode: runtime.SyncNone}
+	h := &handle{mode: runtime.SyncNone, dead: make(chan struct{})}
 	if len(results) > 0 {
 		h.result = results[0]
 	}
@@ -61,9 +69,17 @@ func newHandle(results ...runtime.Result) *handle {
 }
 
 func (h *handle) Exec(ctx context.Context, req runtime.Request) (*runtime.Exec, error) {
+	if h.execErr != nil {
+		return nil, h.execErr
+	}
 	h.seen = append(h.seen, req)
+	h.active++
+	if h.active > h.max {
+		h.max = h.active
+	}
 	return &runtime.Exec{Result: func(context.Context) (runtime.Result, error) {
 		h.calls++
+		h.active--
 		if h.stdout != "" {
 			_, _ = io.WriteString(req.Output.Stdout(), h.stdout)
 		}
@@ -77,14 +93,21 @@ func (h *handle) Close() error {
 }
 
 type backend struct {
-	id  string
-	hdl *handle
+	id       string
+	hdl      *handle
+	connects int
+	// remote marks a backend that runs elsewhere: it opts out of LocalPath.
+	remote bool
 }
+
+// Local reports that this fake runs here, unless the test says otherwise.
+func (b *backend) Local() bool { return !b.remote }
 
 func (b *backend) ID() string   { return b.id }
 func (b *backend) Kind() string { return "fake" }
 
 func (b *backend) Connect(ctx context.Context, h runtime.Host) (runtime.Handle, error) {
+	b.connects++
 	return b.hdl, nil
 }
 
@@ -168,30 +191,56 @@ func TestCallerSuppliedIDWins(t *testing.T) {
 	}
 }
 
-func TestRemoteSyncBackendIsRefused(t *testing.T) {
-	hdl := &handle{mode: runtime.SyncRemote}
-	rt := runtime.New(&host{point: t.TempDir()}, &outputs{}, &backend{id: "fake", hdl: hdl})
-
-	_, err := rt.Exec(context.Background(), "true", runtime.ExecOptions{})
-	if !errors.Is(err, vfs.ErrInvalid) {
-		t.Fatalf("err %v, want ErrInvalid", err)
+// TestPathsForEachKindOfBackend: a local backend gets both forms, a backend
+// that runs elsewhere gets only the portable one, and no mount is resolved for
+// it (go-mapping §6, "路径跨传输").
+func TestPathsForEachKindOfBackend(t *testing.T) {
+	hdl := &handle{mode: runtime.SyncNone}
+	h := &host{point: "/mnt/x"}
+	rt := runtime.New(h, &outputs{}, &backend{id: "local", hdl: hdl})
+	if _, err := rt.Exec(context.Background(), "true", runtime.ExecOptions{Cwd: "/work"}); err != nil {
+		t.Fatalf("exec: %v", err)
 	}
-	if hdl.closed != 1 {
-		t.Fatalf("handle closed %d times, want 1", hdl.closed)
+	if len(hdl.seen) != 1 || hdl.seen[0].Dir != "/mnt/x/work" || hdl.seen[0].Path != "/work" {
+		t.Fatalf("local request %+v", hdl.seen)
+	}
+
+	remoteHandle := &handle{mode: runtime.SyncRemote}
+	asked := &host{point: "/mnt/x"}
+	rt = runtime.New(asked, &outputs{}, &backend{id: "remote", hdl: remoteHandle, remote: true})
+	if _, err := rt.Exec(context.Background(), "true", runtime.ExecOptions{Cwd: "/work"}); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if len(remoteHandle.seen) != 1 {
+		t.Fatalf("handle saw %d requests", len(remoteHandle.seen))
+	}
+	if remoteHandle.seen[0].Dir != "" {
+		t.Fatalf("remote request got a real path: %q", remoteHandle.seen[0].Dir)
+	}
+	if remoteHandle.seen[0].Path != "/work" {
+		t.Fatalf("path %q", remoteHandle.seen[0].Path)
+	}
+	if len(asked.asked) != 0 {
+		t.Fatalf("runtime resolved a path for a remote backend: %v", asked.asked)
 	}
 }
 
-func TestResolveFailureClosesTheHandle(t *testing.T) {
+// TestResolveFailureKeepsTheSession: a caller mistake is not a transport
+// error, so the cached handle stays.
+func TestResolveFailureKeepsTheSession(t *testing.T) {
 	hdl := newHandle()
-	rt := runtime.New(&host{err: vfs.NewError(vfs.CodeNotFound, "/nope")}, &outputs{},
-		&backend{id: "fake", hdl: hdl})
+	b := &backend{id: "fake", hdl: hdl}
+	rt := runtime.New(&host{err: vfs.NewError(vfs.CodeNotFound, "/nope")}, &outputs{}, b)
 
 	_, err := rt.Exec(context.Background(), "true", runtime.ExecOptions{Cwd: "/nope"})
 	if !errors.Is(err, vfs.ErrNotFound) {
 		t.Fatalf("err %v, want ErrNotFound", err)
 	}
-	if hdl.closed != 1 || len(hdl.seen) != 0 {
-		t.Fatalf("closed %d, execs %d: want 1 and 0", hdl.closed, len(hdl.seen))
+	if hdl.closed != 0 || len(hdl.seen) != 0 {
+		t.Fatalf("closed %d, execs %d: want 0 and 0", hdl.closed, len(hdl.seen))
+	}
+	if b.connects != 1 {
+		t.Fatalf("connects %d, want 1", b.connects)
 	}
 }
 
@@ -217,6 +266,109 @@ func TestResultIsRepeatable(t *testing.T) {
 	}
 	if hdl.calls != 1 {
 		t.Fatalf("backend ran %d times, want 1", hdl.calls)
+	}
+	if hdl.closed != 0 {
+		t.Fatalf("handle closed %d times, want 0", hdl.closed)
+	}
+}
+
+// run is one Exec plus its Result.
+func run(t *testing.T, rt *runtime.Runtime, opts runtime.ExecOptions) {
+	t.Helper()
+	ex, err := rt.Exec(context.Background(), "true", opts)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if _, err := ex.Result(context.Background()); err != nil {
+		t.Fatalf("result: %v", err)
+	}
+}
+
+func TestHandlesAreCachedPerBackend(t *testing.T) {
+	hdl := newHandle()
+	b := &backend{id: "fake", hdl: hdl}
+	rt := runtime.New(&host{point: t.TempDir()}, &outputs{}, b)
+
+	run(t, rt, runtime.ExecOptions{})
+	run(t, rt, runtime.ExecOptions{})
+
+	if b.connects != 1 {
+		t.Fatalf("connect ran %d times for two execs, want 1", b.connects)
+	}
+	if hdl.calls != 2 {
+		t.Fatalf("backend ran %d commands, want 2", hdl.calls)
+	}
+}
+
+func TestDeadHandleIsReplaced(t *testing.T) {
+	hdl := newHandle()
+	b := &backend{id: "fake", hdl: hdl}
+	rt := runtime.New(&host{point: t.TempDir()}, &outputs{}, b)
+
+	run(t, rt, runtime.ExecOptions{})
+	close(hdl.dead)
+	run(t, rt, runtime.ExecOptions{})
+
+	if b.connects != 2 {
+		t.Fatalf("connect ran %d times, want 2 after a dead handle", b.connects)
+	}
+}
+
+func TestExecTransportErrorDropsTheHandle(t *testing.T) {
+	hdl := newHandle()
+	hdl.execErr = errors.New("broken pipe")
+	b := &backend{id: "fake", hdl: hdl}
+	rt := runtime.New(&host{point: t.TempDir()}, &outputs{}, b)
+
+	if _, err := rt.Exec(context.Background(), "true", runtime.ExecOptions{}); err == nil {
+		t.Fatalf("exec with a broken handle succeeded")
+	}
+	hdl.execErr = nil
+	run(t, rt, runtime.ExecOptions{})
+
+	if b.connects != 2 {
+		t.Fatalf("connect ran %d times, want 2", b.connects)
+	}
+}
+
+// TestOneCommandAtATimePerHandle: a cached connection carries one execution at
+// a time, so two callers queue instead of interleaving frames.
+func TestOneCommandAtATimePerHandle(t *testing.T) {
+	hdl := newHandle()
+	rt := runtime.New(&host{point: t.TempDir()}, &outputs{}, &backend{id: "fake", hdl: hdl})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ex, err := rt.Exec(context.Background(), "true", runtime.ExecOptions{})
+			if err != nil {
+				t.Errorf("exec: %v", err)
+				return
+			}
+			if _, err := ex.Result(context.Background()); err != nil {
+				t.Errorf("result: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if hdl.max != 1 {
+		t.Fatalf("%d commands ran at once, want 1", hdl.max)
+	}
+	if hdl.calls != 2 {
+		t.Fatalf("backend ran %d commands, want 2", hdl.calls)
+	}
+}
+
+func TestRuntimeCloseClosesCachedHandles(t *testing.T) {
+	hdl := newHandle()
+	rt := runtime.New(&host{point: t.TempDir()}, &outputs{}, &backend{id: "fake", hdl: hdl})
+
+	run(t, rt, runtime.ExecOptions{})
+	if err := rt.Close(); err != nil {
+		t.Fatalf("close: %v", err)
 	}
 	if hdl.closed != 1 {
 		t.Fatalf("handle closed %d times, want 1", hdl.closed)

@@ -33,6 +33,16 @@ const (
 	SyncNone
 )
 
+// LocalPath is a capability: a backend that runs commands on this host needs a
+// real path, and Runtime resolves one before it starts the command.
+//
+// A backend that runs elsewhere leaves this out. Runtime then skips the
+// resolution, so no local mount pays for a command it never runs, and the
+// backend reads Request.Path only (go-mapping §6, "路径跨传输").
+type LocalPath interface {
+	Local() bool
+}
+
 // Host is what a backend may ask of the workspace that owns it.
 type Host interface {
 	// Resolve turns an absolute workspace path into a real path under the
@@ -68,7 +78,7 @@ type Backend interface {
 	Connect(ctx context.Context, host Host) (Handle, error)
 }
 
-// Handle is one connection to a backend. It lives for one Exec.
+// Handle is one connection to a backend. Runtime caches one per backend id.
 //
 // The base interface stays narrow. A capability that only some backends have
 // (sync client, event stream, session reuse) is a separate interface the
@@ -85,6 +95,11 @@ type Handle interface {
 	// the end.
 	Exec(ctx context.Context, req Request) (*Exec, error)
 	Close() error
+	// Closed reports the connection dying on its own. Runtime caches handles,
+	// so it needs a signal that does not wait for the next command to fail.
+	// A backend whose connection cannot die returns a channel that never
+	// closes.
+	Closed() <-chan struct{}
 }
 
 // ExecOptions is a caller's request.
@@ -100,7 +115,12 @@ type ExecOptions struct {
 // backend parses workspace paths.
 type Request struct {
 	Source string
-	Dir    string
+	// Dir is a real path on this host. It is set only for a backend that
+	// implements LocalPath, and is empty otherwise.
+	Dir string
+	// Path is the workspace path Dir was resolved from. It is the only form
+	// of a location that means the same thing on the far side of a transport.
+	Path   string
 	Env    map[string]string
 	Output OutputSink // never nil; runtime asks Outputs for it before the start
 }
@@ -120,7 +140,25 @@ type Result struct {
 	Status   Status
 	ExitCode int
 	Output   execout.Result
+	// Sync is written by the bracket that owns the execution (the workspace
+	// that pushed before it and pulls after it). Runtime carries the field; it
+	// does not interpret it.
+	Sync SyncOutcome
 }
+
+// SyncOutcome says whether the pull after one execution landed.
+//
+// There is no “lost” value: the authoritative side holds every change, so a
+// replaced peer means a full resend, not a loss (ADR 0008).
+type SyncOutcome int
+
+const (
+	// SyncComplete means the bracket's pull landed.
+	SyncComplete SyncOutcome = iota
+	// SyncPending means the pull failed. The command result stands, and the
+	// next bracket resumes from the committed cursor.
+	SyncPending
+)
 
 // Exec is one execution: an id and a result to wait for.
 //
@@ -139,6 +177,27 @@ type Runtime struct {
 	outputs  Outputs
 	backends map[string]Backend
 	order    []string
+
+	mu      sync.Mutex
+	handles map[string]*session
+}
+
+// session is one cached handle. Its mutex makes "one handle, one command
+// stream" true: a connection carries one execution at a time, so two callers
+// queue instead of interleaving frames.
+type session struct {
+	mu sync.Mutex
+	h  Handle
+}
+
+// dead reports whether the handle ended on its own.
+func (s *session) dead() bool {
+	select {
+	case <-s.h.Closed():
+		return true
+	default:
+		return false
+	}
 }
 
 // New builds a Runtime. The last registration for an id wins; ids are
@@ -148,6 +207,7 @@ func New(host Host, outputs Outputs, backends ...Backend) *Runtime {
 		host:     host,
 		outputs:  outputs,
 		backends: make(map[string]Backend, len(backends)),
+		handles:  make(map[string]*session),
 	}
 	for _, b := range backends {
 		r.backends[b.ID()] = b
@@ -163,23 +223,27 @@ func (r *Runtime) Exec(ctx context.Context, source string, opts ExecOptions) (*E
 	if err != nil {
 		return nil, err
 	}
-	h, err := backend.Connect(ctx, r.host)
+	s, err := r.connect(ctx, backend)
 	if err != nil {
 		return nil, err
 	}
-	if h.Sync() != SyncNone {
-		_ = h.Close()
-		return nil, vfs.WrapError(vfs.CodeInvalid, backend.ID(),
-			errors.New("backend declares sync remote: phase two is not implemented"))
-	}
+	// One connection, one command stream.
+	s.mu.Lock()
+
 	cwd := opts.Cwd
 	if cwd == "" {
 		cwd = "/"
 	}
-	dir, err := r.host.Resolve(ctx, cwd)
-	if err != nil {
-		_ = h.Close()
-		return nil, err
+	// Only a backend that runs here needs a real path. Resolving for a remote
+	// backend would mount a volume the command never touches.
+	dir := ""
+	if local, ok := backend.(LocalPath); ok && local.Local() {
+		dir, err = r.host.Resolve(ctx, cwd)
+		if err != nil {
+			// A caller error, not a transport error: keep the session.
+			s.mu.Unlock()
+			return nil, err
+		}
 	}
 	if opts.ID == "" {
 		opts.ID = mintID()
@@ -191,13 +255,59 @@ func (r *Runtime) Exec(ctx context.Context, source string, opts ExecOptions) (*E
 	if opts.Timeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, opts.Timeout)
 	}
-	ex, err := h.Exec(ctx, Request{Source: source, Dir: dir, Env: opts.Env, Output: out})
+	ex, err := s.h.Exec(ctx, Request{Source: source, Dir: dir, Path: cwd, Env: opts.Env, Output: out})
 	if err != nil {
 		cancel()
-		_ = h.Close()
+		s.mu.Unlock()
+		r.drop(backend.ID(), s)
 		return nil, err
 	}
-	return keep(h, backend.ID(), opts.ID, ex, out, cancel), nil
+	return keep(r, backend.ID(), s, opts.ID, ex, out, cancel), nil
+}
+
+// connect returns the cached session for a backend, building one when the
+// cache is empty or the cached handle died.
+func (r *Runtime) connect(ctx context.Context, backend Backend) (*session, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if s, ok := r.handles[backend.ID()]; ok {
+		if s.dead() {
+			_ = s.h.Close()
+			delete(r.handles, backend.ID())
+		} else {
+			return s, nil
+		}
+	}
+	h, err := backend.Connect(ctx, r.host)
+	if err != nil {
+		return nil, err
+	}
+	s := &session{h: h}
+	r.handles[backend.ID()] = s
+	return s, nil
+}
+
+// drop forgets a session and closes its handle.
+func (r *Runtime) drop(backendID string, s *session) {
+	r.mu.Lock()
+	if r.handles[backendID] == s {
+		delete(r.handles, backendID)
+	}
+	r.mu.Unlock()
+	_ = s.h.Close()
+}
+
+// Close closes every cached handle. Executions must have finished first.
+func (r *Runtime) Close() error {
+	r.mu.Lock()
+	handles := r.handles
+	r.handles = make(map[string]*session)
+	r.mu.Unlock()
+	for _, s := range handles {
+		_ = s.h.Close()
+	}
+	return nil
 }
 
 // finalizeTimeout bounds the flush of an execution that has just ended.
@@ -207,7 +317,7 @@ const finalizeTimeout = 5 * time.Second
 //
 // Finalize runs here, not in the backend, so every backend gets the output
 // contract for free.
-func keep(h Handle, backendID, id string, ex *Exec, out OutputSink, cancel context.CancelFunc) *Exec {
+func keep(r *Runtime, backendID string, s *session, id string, ex *Exec, out OutputSink, cancel context.CancelFunc) *Exec {
 	inner := ex.Result
 	var mu sync.Mutex
 	var once sync.Once
@@ -225,8 +335,12 @@ func keep(h Handle, backendID, id string, ex *Exec, out OutputSink, cancel conte
 			outRes, ferr := out.Finalize(fctx)
 			fcancel()
 			cancel()
-			// One Exec, one handle: the connection dies with the work.
-			_ = h.Close()
+			// The session goes back to the cache, unless the handle died on
+			// its own or the command failed at the transport.
+			s.mu.Unlock()
+			if resErr != nil || s.dead() {
+				r.drop(backendID, s)
+			}
 			res.Output = outRes
 			if ferr != nil {
 				res.Output.Err = errors.Join(res.Output.Err, ferr)

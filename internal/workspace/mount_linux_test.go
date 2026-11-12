@@ -62,7 +62,7 @@ func TestExecWritesThroughTheMount(t *testing.T) {
 		t.Fatalf("second result: %v", err)
 	}
 	if got, err := w.ReadFile(ctx, "/copy"); err != nil || string(got.Data) != "hi" {
-		t.Fatalf("copy = %q (%v), want hi", got, err)
+		t.Fatalf("copy = %q (%v), want hi", got.Data, err)
 	}
 
 	point := w.MountPoint()

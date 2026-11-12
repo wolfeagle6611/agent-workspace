@@ -42,8 +42,8 @@ func TestMountRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read from store: %v", err)
 	}
-	if string(got) != "hi" {
-		t.Fatalf("store saw %q", got)
+	if string(got.Data) != "hi" {
+		t.Fatalf("store saw %q", got.Data)
 	}
 
 	entries, err := os.ReadDir(point)

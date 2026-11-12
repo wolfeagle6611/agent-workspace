@@ -138,10 +138,13 @@ type ChunkRef struct {
 }
 
 // 水位与它描述的数据在同一事务写入。
+// 宿主用 PushRev / FetchRev / FetchPath；镜像只用 Generation 判断换代
+// （ADR 0008）。两侧同一张表，各用各的字段。
 type Watermark struct {
-	PushRev  int64 // 已推送到对端的最后一个 rev
-	FetchRev int64 // 已从对端拉到的 rev
+	PushRev   int64  // 已推送到对端的最后一个 rev
+	FetchRev  int64  // 已从对端拉到的 rev
 	FetchPath string // nil 语义用空串；表示该 rev 内推进到哪个路径
+	Generation string // 仅镜像：镜像库首建时的随机标识
 }
 ```
 
@@ -158,11 +161,13 @@ type SyncClient interface {
 	PushObjects(ctx context.Context, objects ObjectStream) error
 }
 
-// 两种失败必须能被调用方区分，所以用哨兵错误而不是字符串。
-var (
-	ErrExecLost = errors.New("execution lost: runtime replaced")  // 对应 EEXEC_LOST
-	ErrSyncLost = errors.New("sync lost: runtime replaced")       // 对应 ESYNC_LOST
-)
+// SenderRevBlank 表示“我是空白接收方，请全量发”。上游把它写成 senderRev 的
+// 一个分支（= 0），漏掉它会让外部写入被接收方吞掉。
+const SenderRevBlank int64 = 0
+
+// 执行丢失必须能被调用方区分，所以用哨兵错误而不是字符串。
+// 同步没有对应项：权威侧存着全部数据，换代只会重发（ADR 0008）。
+var ErrExecLost = errors.New("execution lost: runtime replaced") // EEXEC_LOST
 ```
 
 ### 3.5 编排顺序（伪代码）
@@ -203,9 +208,11 @@ func (w *Workspace) execContainer(ctx context.Context, cmd string, opts ExecOpti
 | 3 | 单一 `Exec` 入口 + 子进程后端（`sync: "none"`） | 换后端不改调用方；子进程写的文件立刻出现在 `fs` 里 |
 | 4 | 取消与超时（进程组）+ 输出截断与落盘 | 超时后无孤儿进程；打印 10 万行不爆内存 |
 | 5 | `baseRev` 前置条件 | 两个写者共读一个 `rev` 后写同一路径：一个成功，另一个得到 `ECONFLICT` 并带新 `CurrentRev`，可重读重试 |
-| 6 | （第二阶段）远端 / 容器后端 + push / pull + 水位 | 杀掉对端后重连，续传不重复应用 |
+| 6a | （第二阶段）变更日志 + 水位 + 合并分页 + 应用 + 探测补字节 + 帧编解码（`internal/peer`）+ `net.Pipe` 假对端 | 五个断点全绿：探测之后、字节发一半、第一批应用之后、应用已提交而回复丢失、pull 首页之后 |
+| 6b | （第二阶段）`serve` 子命令 + 握手 + `Result.Sync` + 执行包夹 | 杀掉对端后重连，续传不重复应用 |
+| 6c | （第二阶段）远端执行协议：`exec` / 输出流 / `kill` + `remote` 后端 | 命令跑在镜像的挂载点里，写入经 pull 回到宿主；超时杀整个进程组，结果 `Cancelled` 与 `ExitCode -1` |
 
-第 1–2 步之前不要碰执行面。第 6 步之前不要写水位表：没有对手方时，那些表只会腐烂。
+第 1–2 步之前不要碰执行面。第 6a 步之前不要写水位表：没有对手方时，那些表只会腐烂。6a 与 6b 的形状见 ADR 0008。
 
 ## 6. 第一阶段已定约定
 
@@ -248,8 +255,34 @@ func (w *Workspace) execContainer(ctx context.Context, cmd string, opts ExecOpti
 | 输出裁剪 | 全文放工作区 `/.computer/output/<backend>.<id>.stdout|stderr.log`，路径写进结果；exec 结束时按 `rev` 降序保留最近 50 个条目 | 与上游路径一致，读取复用现有 `fs` API；目录即契约，名字模式不参与裁剪；裁剪失败不改写结果 |
 | 执行与 `Close` | `Close` 取消工作区根 ctx，最多等 5 秒，再关库 | 库不在活写者下面关闭 |
 | 目录创建与 `rev` | `mkdir` 推进 `rev`，但不产生变更事件 | 第二阶段做变更流时要知道：有些 `rev` 不对应任何条目 |
-| backend 路由 | `ExecOptions.Backend` 空串 = 唯一注册的后端；多个后端加空串 = `EINVAL`；未注册 id = `ENOBACKEND` | 空串猜错后端比报错更糟 |
-| 执行句柄 | 每次 `Exec` 一次 `Connect` / `Close`；`Result` 可重复调，只等一次 | 子进程后端连接无成本；缓存是远端传输的需要 |
+| backend 路由 | `ExecOptions.Backend` 空串 = 唯一注册的后端；多个后端加空串 = `EINVAL`；未注册 id = `ENOBACKEND`；`Options.PeerSocket` 只表示镜像，`Options.Remote` 才注册远端后端 | 空串猜错后端比报错更糟；一个配置项只表示一件事 |
+| 执行句柄 | `Runtime` 按 backend id 缓存一个 `Handle`；一个句柄同时只跑一条命令；`Closed()` 关闭即换新；传输错误丢掉句柄，命令不重放 | 缓存省掉每次执行的拨号；`Closed()` 让空闲期间死掉的连接在下次使用之前被发现；不重放是 §5.5 的硬规矩 |
+| 陈旧句柄 | 对端在空闲期重启时，宿主下一条命令失败一次，再下一条重连成功 | “命令不重放”的代价落在第一条命令上，不落在静默重试上；对端关停必须关闭空闲连接，否则宿主察觉不到 |
+| 句柄关闭 | `Runtime.Close` 关闭所有缓存句柄；`Workspace.Close` 在等到执行结束之后调用它 | 句柄不在活写者下面关闭 |
+| 同步重试 | push 与 pull 各重试一次，重试前先换会话 | 重连是常态而非异常；两个方向都是状态式，重发不会重复写（computer.md §5.5） |
+| push 水位断言 | 每次 push 结尾发一次 `ping`，取回对端 `applied` 游标并断言它覆盖本次推送 | 没有断言时，一个断掉的对端在“没有变更可推”时看起来是正常的；断言让安全门真的关上（computer.md §5.1） |
+| 无对端 | `Options.PeerSocket` 为空时 push / pull 是空操作 | 第一阶段的工作区不该被迫认识同步（ADR 0006） |
+| 传输 | 正向拨号，unix socket，`Transport` 接口后面；反向拨号留给跨机器 | 取法对象反向拨号是为出网布线与休眠付的账，本机不成立（ADR 0005、0008） |
+| 镜像库 | 复用 `internal/vfs`，独立库文件，跨重启耐久；删库即“空白对端” | 一套 schema、一套 chunk 实现；“续传不重复应用”要靠它才能验证 |
+| 换代 | 镜像库首建写随机 `generation`，握手比对；不一致即复位游标、全量重发 | 权威侧有全部数据，所以“丢失”不可表示，只有“重发”（ADR 0008） |
+| 线上编码 | 长度前缀帧 + JSON；chunk 字节走原始分段 | 一条消息一帧；假对端与真对端走同一段编解码 |
+| `senderRev` | `SenderRevBlank`（0）表示空白接收方，全量发；`> 0` 表示按上游游标增量发 | 上游的 `= 0` 分支是修 bug 修出来的，漏掉会吞掉外部写入 |
+| pull 与 `baseRev` | pull 每批一个事务、铸一个 `rev`、不带前置条件 | 它是第三个不可中断写者：FUSE、exec、pull 都不带前置条件（ADR 0007、0008） |
+| 变更日志 | `vfs_changes(rev, path, kind, mode, mtime)` 追加写；删除写墓碑 | 结构错误与删除都靠它传播；不存 chunk 引用，合并时再物化 |
+| 合并分页 | 按 `(rev, path)` 分页读，页长 256；同一路径可跨页重发 | 一次大改名不占整棵树的内存；重发安全，因为应用是状态式（ADR 0003） |
+| 墓碑保留 | `rev` 小于两侧水位的日志行可删；与 blob GC 同一次跑 | 两侧都过了，就没有人还要它 |
+| 游标编码 | 单行两列 `fetch_rev` / `fetch_path`，空串表示该 `rev` 已走完 | SQLite 的主键允许 `NULL`，空串没有这个坑 |
+| 重连顺序 | 先 pull 再 push | 镜像里有上次命令写完、未回流的变更；先 push 会用宿主旧版本盖掉它们 |
+| 合并归属 | 发送方本地读自己的变更日志；`changes` 请求只用于 pull 方向 | 跨链路只传条目、哈希与缺失字节；把 push 的条目也放上链路就多一次往返 |
+| 路径跨传输 | `Request` 带 `Path`（工作区路径）与 `Dir`（本机真实路径）；只有实现 `LocalPath` 的后端才拿到 `Dir`，远端后端只看 `Path` | 真实路径在对端没有意义；只为本机后端解析，远端命令不会白挂一次 FUSE |
+| 线类型 | 线格式类型住在 `peer`，与 `vfs` 之间显式转换 | vfs 改字段名不能静默变成协议变更 |
+| 客户端构造 | `peer.Open` 在构造里握手；没有“未握手客户端”这种状态 | `Pull` 从握手取对端 `rev` 上界，漏了握手会静默拉空 |
+| 远端输出 | 对端只把字节流成帧，落盘、尾部窗口、路径命名都由宿主做 | 输出是一件事，`/.computer/output` 的契约只有一处；对端不落盘就不需要 pull 回输出 |
+| 远端取消 | `kill` 走第二条连接；exec 流不与方法交错 | 流上只有一个请求，插入控制帧要双向读；控制连接让 `exec` 保持单向 |
+| 未知 exec id | 注册表里没有这个名字时回 `EEXEC_LOST` | “丢失”与“没有”是两种事实（§6 执行记录） |
+| 输出编码 | 输出走 JSON 帧（`[]byte` 即 base64）；chunk 字节仍走原始分段 | 输出是小帧多、对象是大字节少；两种形状各用各的编码 |
+| 结果形状 | `Result{Status, ExitCode, Output, Sync}`；pull 失败只置 `Sync = Pending` | pull 失败不改写命令结果，但调用方必须知道这轮没回流 |
+| blob GC | 两侧共用一份实现，规则“无引用且 `last_seen` 早于 60 秒”，触发点为 `Close` 与数量阈值；GC 不铸 `rev` | GC 不是变更，不能推进游标；60 秒覆盖“探测与补字节之间”的空档 |
 
 ## 7. 错误模型
 
@@ -267,7 +300,8 @@ func (w *Workspace) execContainer(ctx context.Context, cmd string, opts ExecOpti
 | `ECONFLICT` | `baseRev` 与当前版本不匹配 | `Path`, `BaseRev`, `CurrentRev` |
 | `ENOBACKEND` | `ExecOptions.Backend` 未注册 | `Path`（该 id） |
 | `EEXEC_LOST` | 执行 id 属于已消失的进程 | `ExecID` |
-| `ESYNC_LOST` | 第二阶段：同步对端被替换 | `RuntimeIDs` |
+
+`ESYNC_LOST` 已删除（ADR 0008）。同步对端换代不是错误，是“复位游标、全量重发”。
 
 ```go
 // 示意代码，不可编译。
@@ -278,14 +312,13 @@ var (
 )
 
 type Error struct {
-	Code       string   // ENOENT / ECONFLICT / ...
+	Code       string // ENOENT / ECONFLICT / ...
 	Path       string
-	TargetPath string   // 仅 rename
+	TargetPath string // 仅 rename
 	BaseRev    int64
 	CurrentRev int64
 	ExecID     string
-	RuntimeIDs []string // 仅第二阶段 ESYNC_LOST
-	err        error    // 底层原因，可为 nil
+	err        error // 底层原因，可为 nil
 }
 
 func (e *Error) Error() string
@@ -302,13 +335,13 @@ func (e *Error) Unwrap() []error   // 按 Code 返回对应哨兵，让 errors.I
 
 | # | 不做 | 理由 | 何时回来 |
 | --- | --- | --- | --- |
-| 1 | 远端 / 容器后端与 push/pull | ADR 0006 | 出现远端执行或第二个读者 |
 | 2 | 模块后端（goja 等） | 最容易后加 | 需要隔离 JS 时 |
 | 3 | data mount（外部来源铺子树） | 没有对应数据源 | 需要预置只读内容时 |
 | 4 | git 客户端、artifacts、assets | 外围能力 | 底层稳定后 |
 | 5 | agent 工具适配器 | 先有底座再谈上层 | 有第一个真实调用方时 |
 | 6 | 多租户鉴权与配额 | 本地单用户部署，鉴权属部署层 | 变多租户时 |
 | 7 | 快照 / 时间旅行 / fork | 需要历史，与续传点语义冲突 | 需要审计时 |
+| 7a | 空目录同步 | 目录创建不产生变更事件（§6），目录随子项出现 | 调用方依赖空目录时 |
 | 8 | 硬链接身份、xattr、设备文件 | 用拓扑简单化换实现规模 | 有真实调用方需要 |
 | 9 | 内容定义分块 | 固定分块够用 | 出现大量插入型大文件写 |
 | 10 | 后台 GC 守护进程 | 改在 `Close` 时与阈值触发 | 出现长时间常驻工作区 |

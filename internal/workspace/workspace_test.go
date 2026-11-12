@@ -114,29 +114,41 @@ func TestCloseIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestRelativeMountRootIsInvalid(t *testing.T) {
+// TestRemoteNeedsAPeerSocket: Remote adds a backend that runs on the mirror,
+// so it is meaningless without one.
+func TestRemoteNeedsAPeerSocket(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := Open(filepath.Join(dir, "ws.db"), Options{MountRoot: "relative/path"}); !errors.Is(err, vfs.ErrInvalid) {
+	_, err := Open(filepath.Join(dir, "ws.db"), Options{Remote: true})
+	if !errors.Is(err, vfs.ErrInvalid) {
 		t.Fatalf("err %v, want ErrInvalid", err)
 	}
 }
 
-func TestMountIDDiffersForSameDatabaseName(t *testing.T) {
-	first, err := mountID(filepath.Join(t.TempDir(), "ws.db"))
+// TestRemoteBackendIsNamedAndRouted: two backends cannot be picked by an empty
+// name, and an unknown name is reported by routing, not by the mirror
+// (go-mapping §6). The mirror here serves sync only, and the push gate runs
+// before routing, so the peer must be alive.
+func TestRemoteBackendIsNamedAndRouted(t *testing.T) {
+	m := startMirror(t)
+	dir := t.TempDir()
+	w, err := Open(filepath.Join(dir, "ws.db"), Options{MountRoot: dir, PeerSocket: m.socket, Remote: true})
 	if err != nil {
-		t.Fatalf("mountID: %v", err)
+		t.Fatalf("open: %v", err)
 	}
-	second, err := mountID(filepath.Join(t.TempDir(), "ws.db"))
-	if err != nil {
-		t.Fatalf("mountID: %v", err)
+	defer w.Close()
+
+	if _, err := w.Exec(t.Context(), "true", runtime.ExecOptions{}); !errors.Is(err, vfs.ErrInvalid) {
+		t.Fatalf("err %v for an unnamed backend, want ErrInvalid", err)
 	}
-	// Same file name, different databases: Prepare clears whatever it finds
-	// at a mount point, so these must not share one.
-	if first == second {
-		t.Fatalf("both databases use mount id %q", first)
+	if _, err := w.Exec(t.Context(), "true", runtime.ExecOptions{Backend: "nope"}); !errors.Is(err, vfs.ErrNoBackend) {
+		t.Fatalf("err %v for an unknown backend, want ErrNoBackend", err)
 	}
-	if !strings.HasPrefix(first, "ws-") {
-		t.Fatalf("mount id %q does not start with the file name", first)
+}
+
+func TestRelativeMountRootIsInvalid(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Open(filepath.Join(dir, "ws.db"), Options{MountRoot: "relative/path"}); !errors.Is(err, vfs.ErrInvalid) {
+		t.Fatalf("err %v, want ErrInvalid", err)
 	}
 }
 

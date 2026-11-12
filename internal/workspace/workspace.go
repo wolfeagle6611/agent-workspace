@@ -8,8 +8,6 @@ package workspace
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"path/filepath"
 	"sort"
@@ -18,9 +16,11 @@ import (
 	"sync"
 	"time"
 
+	"gitlab.webullbroker.com/webull-go/agent-design/internal/backend/remote"
 	"gitlab.webullbroker.com/webull-go/agent-design/internal/backend/shell"
 	"gitlab.webullbroker.com/webull-go/agent-design/internal/execout"
 	"gitlab.webullbroker.com/webull-go/agent-design/internal/mount"
+	"gitlab.webullbroker.com/webull-go/agent-design/internal/peer"
 	"gitlab.webullbroker.com/webull-go/agent-design/internal/runtime"
 	"gitlab.webullbroker.com/webull-go/agent-design/internal/vfs"
 )
@@ -40,6 +40,13 @@ type Options struct {
 	// MountRoot is the directory mount points live in. Empty means
 	// mount.DefaultRoot(). It must be absolute.
 	MountRoot string
+	// PeerSocket is the unix socket of a mirror this workspace syncs with.
+	// Empty means no peer: push and pull do nothing (ADR 0006, ADR 0008).
+	PeerSocket string
+	// Remote registers the backend that runs commands on that mirror. It
+	// needs PeerSocket, and it makes ExecOptions.Backend mandatory: two
+	// backends cannot be picked by an empty name (go-mapping §6).
+	Remote bool
 }
 
 // Workspace is one workspace: store, mount session, and execution entry.
@@ -53,6 +60,15 @@ type Workspace struct {
 	root    context.Context
 	stop    context.CancelFunc
 	running sync.WaitGroup
+
+	// The mirror session. syncMu serialises use of the one socket, and dial
+	// is nil when no peer is configured.
+	resolver func(ctx context.Context, path string) (string, error)
+
+	syncMu        sync.Mutex
+	dial          dialer
+	peer          *peer.Client
+	everConnected bool
 
 	mu     sync.Mutex
 	closed bool
@@ -77,7 +93,7 @@ func Open(dbPath string, opts Options) (*Workspace, error) {
 	if !filepath.IsAbs(root) {
 		return nil, vfs.NewError(vfs.CodeInvalid, root)
 	}
-	id, err := mountID(dbPath)
+	id, err := mount.MountID(dbPath)
 	if err != nil {
 		return nil, err
 	}
@@ -93,45 +109,53 @@ func Open(dbPath string, opts Options) (*Workspace, error) {
 		return nil, err
 	}
 	rootCtx, stop := context.WithCancel(context.Background())
+	var d dialer
+	if opts.PeerSocket != "" {
+		d = unixDial(opts.PeerSocket)
+	}
 	w := &Workspace{
 		store:   store,
 		session: mount.NewSession(mount.NewVolume(store), mount.NewManager(root), id),
 		root:    rootCtx,
 		stop:    stop,
+		dial:    d,
 	}
-	w.rt = runtime.New(w, w, shell.New())
+	w.resolver = mount.Resolver(store, w.session)
+	// Two knobs, two meanings: PeerSocket is the mirror to sync with, Remote
+	// adds the backend that runs commands there. A workspace can have either
+	// without the other.
+	backends := []runtime.Backend{shell.New()}
+	if opts.Remote {
+		if d == nil {
+			return nil, vfs.WrapError(vfs.CodeInvalid, "",
+				errors.New("a remote backend needs a peer socket"))
+		}
+		backends = append(backends, remote.New(opts.PeerSocket))
+	}
+	w.rt = runtime.New(w, w, backends...)
 	return w, nil
-}
-
-// mountID names the mount point of a database.
-//
-// The name carries a hash of the absolute database path. Manager.Prepare
-// clears whatever it finds at a mount point, so two databases that share a
-// file name must not share a point: the second Open would unmount the first
-// and route its writes to the wrong store.
-func mountID(dbPath string) (string, error) {
-	abs, err := filepath.Abs(dbPath)
-	if err != nil {
-		return "", vfs.WrapError(vfs.CodeInvalid, dbPath, err)
-	}
-	base := strings.TrimSuffix(filepath.Base(abs), filepath.Ext(abs))
-	if base == "" || base == "." || base == string(filepath.Separator) {
-		return "", vfs.NewError(vfs.CodeInvalid, dbPath)
-	}
-	sum := sha256.Sum256([]byte(abs))
-	return base + "-" + hex.EncodeToString(sum[:4]), nil
 }
 
 // Exec runs source through the single execution entry.
 //
-// The workspace adds two things the runtime cannot: a root cancel that
-// Close can pull, and the output prune after the text has landed.
+// The workspace adds three things the runtime cannot: the push gate before the
+// start, the root cancel Close can pull, and the pull plus the output prune
+// after the text has landed.
 func (w *Workspace) Exec(ctx context.Context, source string, opts runtime.ExecOptions) (*runtime.Exec, error) {
 	if err := w.begin(); err != nil {
 		return nil, err
 	}
 	ectx, cancel := context.WithCancel(ctx)
 	stopRoot := context.AfterFunc(w.root, cancel)
+
+	// The push is a safety gate: a command never starts against a stale view
+	// of the mirror (computer.md §5.1).
+	if err := w.push(ectx); err != nil {
+		stopRoot()
+		cancel()
+		w.running.Done()
+		return nil, err
+	}
 
 	ex, err := w.rt.Exec(ectx, source, opts)
 	if err != nil {
@@ -147,9 +171,15 @@ func (w *Workspace) Exec(ctx context.Context, source string, opts runtime.ExecOp
 		res, err := inner(ctx)
 		once.Do(func() {
 			stopRoot()
-			// The command's context may be done; the prune still needs to
-			// reach the store before Close does.
-			w.prune(context.WithoutCancel(ctx))
+			// The command's context may be done; the pull and the prune still
+			// need to reach the store before Close does.
+			rest := context.WithoutCancel(ctx)
+			if perr := w.pull(rest); perr != nil {
+				// The command stands. The next bracket resumes the pull from
+				// the committed cursor (go-mapping §6).
+				res.Sync = runtime.SyncPending
+			}
+			w.prune(rest)
 			cancel()
 			w.running.Done()
 		})
@@ -235,36 +265,13 @@ func (w *Workspace) MountPoint() string {
 
 // Resolve turns a workspace path into a real path under the mount point.
 //
-// It is the only place where a workspace path becomes a real path, so the
-// rules live here once: reject a relative path or "..", require the path to
-// exist, require a directory, and mount on demand (go-mapping §5 step 3).
+// The rules live in mount.Resolver: this method only adds the closed-workspace
+// check and the lazy mount.
 func (w *Workspace) Resolve(ctx context.Context, p string) (string, error) {
 	if err := w.ensureOpen(); err != nil {
 		return "", err
 	}
-	if p == "" {
-		p = "/"
-	}
-	clean, err := vfs.Clean(p)
-	if err != nil {
-		return "", err
-	}
-	st, err := w.store.Stat(ctx, clean)
-	if err != nil {
-		return "", err
-	}
-	if st.Type != vfs.TypeDir {
-		return "", vfs.NewError(vfs.CodeNotDir, p)
-	}
-
-	point, err := w.session.Mount(ctx)
-	if err != nil {
-		return "", err
-	}
-	if clean == "/" {
-		return point, nil
-	}
-	return filepath.Join(point, clean), nil
+	return w.resolver(ctx, p)
 }
 
 // ensureOpen refuses work on a closed workspace before anything else reads
@@ -296,7 +303,10 @@ func (w *Workspace) Close() error {
 	w.waitRunning(closeGrace)
 
 	ctx := context.Background()
-	errs := []error{w.session.Unmount(ctx)}
+	errs := []error{w.rt.Close(), w.session.Unmount(ctx)}
+	w.syncMu.Lock()
+	w.dropPeer()
+	w.syncMu.Unlock()
 	if err := w.store.Close(); err != nil {
 		errs = append(errs, err)
 	}

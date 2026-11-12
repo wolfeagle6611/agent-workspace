@@ -37,18 +37,19 @@ func (s *Store) WriteAt(ctx context.Context, path string, off int64, data []byte
 			return err
 		}
 		var inode, size int64
+		mode := uint32(0o644)
 		if node == nil {
 			if off != 0 {
 				return newError(CodeNotFound, path)
 			}
-			if inode, err = createNode(ctx, tx, parent, base, TypeFile, 0o644, now); err != nil {
+			if inode, err = createNode(ctx, tx, parent, base, TypeFile, mode, now); err != nil {
 				return err
 			}
 		} else {
 			if node.Type == TypeDir {
 				return newError(CodeIsDir, path)
 			}
-			inode, size = node.Inode, node.Size
+			inode, size, mode = node.Inode, node.Size, node.Mode
 		}
 
 		rev, err := mintRev(ctx, tx)
@@ -66,7 +67,7 @@ func (s *Store) WriteAt(ctx context.Context, path string, off int64, data []byte
 		if err != nil {
 			return wrapError(CodeInvalid, path, err)
 		}
-		return nil
+		return logChange(ctx, tx, rev, clean, KindFile, mode, now)
 	})
 }
 
@@ -136,7 +137,7 @@ func (s *Store) Truncate(ctx context.Context, path string, size int64, opts *Mut
 		); err != nil {
 			return wrapError(CodeInvalid, path, err)
 		}
-		return nil
+		return logChange(ctx, tx, rev, clean, KindFile, node.Mode, now)
 	})
 }
 
@@ -178,7 +179,8 @@ func (s *Store) Remove(ctx context.Context, path string, opts *MutateOptions) er
 		}
 		inode := node.Inode
 
-		if _, err := mintRev(ctx, tx); err != nil {
+		rev, err := mintRev(ctx, tx)
+		if err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
@@ -190,19 +192,26 @@ func (s *Store) Remove(ctx context.Context, path string, opts *MutateOptions) er
 		if _, err := tx.ExecContext(ctx, `DELETE FROM vfs_nodes WHERE inode = ?`, inode); err != nil {
 			return wrapError(CodeInvalid, path, err)
 		}
-		return nil
+		return logChange(ctx, tx, rev, clean, KindDelete, node.Mode, node.MTime)
 	})
 }
 
-// createNode inserts a node and its directory entry.
+// createNode inserts a node and its directory entry, minting its own rev.
 func createNode(ctx context.Context, tx *sql.Tx, parent int64, name string, typ NodeType, mode uint32, now int64) (int64, error) {
 	rev, err := mintRev(ctx, tx)
 	if err != nil {
 		return 0, err
 	}
+	return insertNode(ctx, tx, parent, name, typ, mode, now, rev)
+}
+
+// insertNode inserts a node and its directory entry at an explicit rev.
+//
+// Apply shares one rev across a whole batch, so it cannot mint per node.
+func insertNode(ctx context.Context, tx *sql.Tx, parent int64, name string, typ NodeType, mode uint32, mtime, rev int64) (int64, error) {
 	res, err := tx.ExecContext(ctx,
 		`INSERT INTO vfs_nodes(type, mode, size, mtime, rev) VALUES (?, ?, 0, ?, ?)`,
-		string(typ), mode, now, rev,
+		string(typ), mode, mtime, rev,
 	)
 	if err != nil {
 		return 0, wrapError(CodeInvalid, name, err)

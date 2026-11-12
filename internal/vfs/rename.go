@@ -107,9 +107,20 @@ func (s *Store) Rename(ctx context.Context, src, dst string, opts *MutateOptions
 		if err != nil {
 			return err
 		}
+
+		// A rename mints one rev and bills it by subtree size (ADR 0003):
+		// every path that disappears gets a tombstone, every path that
+		// appears gets an entry, all at this rev.
+		if err := subtreePaths(ctx, tx, srcNode.Inode, cleanSrc, func(p string, st *Stat) error {
+			return logChange(ctx, tx, rev, p, KindDelete, st.Mode, st.MTime)
+		}); err != nil {
+			return err
+		}
+
 		if dstNode != nil {
 			// The replaced node goes away; its chunks go with it through
-			// ON DELETE CASCADE.
+			// ON DELETE CASCADE. It logs no tombstone: the entry below names
+			// the same path in the same rev, and the receiver applies state.
 			if _, err := tx.ExecContext(ctx,
 				`DELETE FROM vfs_dirents WHERE parent_inode = ? AND name = ?`, dstParent, dstBase,
 			); err != nil {
@@ -132,6 +143,13 @@ func (s *Store) Rename(ctx context.Context, src, dst string, opts *MutateOptions
 		); err != nil {
 			return wrapError(CodeInvalid, cleanSrc, err)
 		}
-		return nil
+
+		return subtreePaths(ctx, tx, srcNode.Inode, cleanDst, func(p string, st *Stat) error {
+			kind := KindFile
+			if st.Type == TypeDir {
+				kind = KindDir
+			}
+			return logChange(ctx, tx, rev, p, kind, st.Mode, st.MTime)
+		})
 	})
 }

@@ -133,7 +133,10 @@ func (s *Store) WriteFile(ctx context.Context, path string, data []byte, opts *M
 				return wrapError(CodeInvalid, path, err)
 			}
 		}
-		return chunks.Put(ctx, tx, inode, data, now)
+		if err := chunks.Put(ctx, tx, inode, data, now); err != nil {
+			return err
+		}
+		return logChange(ctx, tx, rev, clean, KindFile, mode, now)
 	})
 }
 

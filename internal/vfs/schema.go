@@ -1,7 +1,10 @@
 package vfs
 
 // schemaVersion is stored in vfs_meta and bumped by migrations.
-const schemaVersion = 1
+//
+// 2 adds the change log and the sync bookkeeping (ADR 0008). The DDL is
+// idempotent, so an older database gains the new tables on Open.
+const schemaVersion = 2
 
 // rootInode is always 1 and always a directory. Invariant from
 // docs/architecture/computer.md §4.3.
@@ -52,4 +55,34 @@ CREATE TABLE IF NOT EXISTS vfs_chunks (
 
 CREATE INDEX IF NOT EXISTS vfs_dirents_child ON vfs_dirents(child_inode);
 CREATE INDEX IF NOT EXISTS vfs_chunks_hash   ON vfs_chunks(hash);
+
+-- Append-only log of committed changes. One row per (rev, path): a single
+-- mutation names each path once. Deletes write a tombstone here, because a
+-- removed dirent leaves no trace the peer could compare against.
+-- Chunk refs are not stored; coalesce reads the live node instead.
+CREATE TABLE IF NOT EXISTS vfs_changes (
+	rev   INTEGER NOT NULL,
+	path  TEXT    NOT NULL,
+	kind  TEXT    NOT NULL CHECK (kind IN ('file', 'dir', 'delete')),
+	mode  INTEGER NOT NULL,
+	mtime INTEGER NOT NULL,
+	PRIMARY KEY (rev, path)
+);
+
+CREATE INDEX IF NOT EXISTS vfs_changes_path ON vfs_changes(path);
+
+-- Sync bookkeeping for one peer pair. One row, both roles: the host uses
+-- push_rev / fetch_rev / fetch_path, the mirror uses applied_rev /
+-- applied_path (ADR 0008). Both record their own generation and the
+-- generation they last saw from the peer.
+CREATE TABLE IF NOT EXISTS vfs_sync (
+	id              TEXT PRIMARY KEY,
+	push_rev        INTEGER NOT NULL DEFAULT 0,
+	fetch_rev       INTEGER NOT NULL DEFAULT 0,
+	fetch_path      TEXT    NOT NULL DEFAULT '',
+	applied_rev     INTEGER NOT NULL DEFAULT 0,
+	applied_path    TEXT    NOT NULL DEFAULT '',
+	generation      TEXT    NOT NULL DEFAULT '',
+	peer_generation TEXT    NOT NULL DEFAULT ''
+);
 `

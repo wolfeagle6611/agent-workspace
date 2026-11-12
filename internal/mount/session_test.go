@@ -3,6 +3,8 @@ package mount
 import (
 	"context"
 	"errors"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"gitlab.webullbroker.com/webull-go/agent-design/internal/vfs"
@@ -43,5 +45,24 @@ func TestSessionRefusesMountAfterUnmount(t *testing.T) {
 	}
 	if _, err := s.Mount(ctx); !errors.Is(err, vfs.ErrClosed) {
 		t.Fatalf("second mount = %v, want ErrClosed", err)
+	}
+}
+
+// TestMountIDDiffersForSameDatabaseName: Prepare clears whatever it finds at a
+// mount point, so two databases that share a file name must not share one.
+func TestMountIDDiffersForSameDatabaseName(t *testing.T) {
+	first, err := MountID(filepath.Join(t.TempDir(), "ws.db"))
+	if err != nil {
+		t.Fatalf("mount id: %v", err)
+	}
+	second, err := MountID(filepath.Join(t.TempDir(), "ws.db"))
+	if err != nil {
+		t.Fatalf("mount id: %v", err)
+	}
+	if first == second {
+		t.Fatalf("both databases use mount id %q", first)
+	}
+	if !strings.HasPrefix(first, "ws-") {
+		t.Fatalf("mount id %q does not start with the file name", first)
 	}
 }

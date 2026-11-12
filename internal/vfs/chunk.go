@@ -263,3 +263,34 @@ func (chunkStore) putChunk(ctx context.Context, tx *sql.Tx, inode, idx int64, bu
 	}
 	return nil
 }
+
+// Link points a file at chunks whose bytes are already in the blob store.
+//
+// Sync sends hashes first and bytes only for what the peer lacks, so an
+// applied file finds its blobs staged already. A missing blob is an
+// integrity error, not a slow path: it means the probe and the apply
+// disagreed about the same hash.
+func (chunkStore) Link(ctx context.Context, tx *sql.Tx, inode int64, refs []ChunkRef, now int64) error {
+	for idx, ref := range refs {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE vfs_blobs SET last_seen = ? WHERE hash = ?`, now, ref.Hash[:],
+		)
+		if err != nil {
+			return wrapError(CodeInvalid, "", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return wrapError(CodeInvalid, "", err)
+		}
+		if n == 0 {
+			return &Error{Code: CodeInvalid, Err: fmt.Errorf("chunk %x is not staged", ref.Hash)}
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO vfs_chunks(inode, idx, hash, size) VALUES (?, ?, ?, ?)`,
+			inode, int64(idx), ref.Hash[:], ref.Size,
+		); err != nil {
+			return wrapError(CodeInvalid, "", err)
+		}
+	}
+	return nil
+}

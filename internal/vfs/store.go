@@ -60,12 +60,32 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("seed meta: %w", err)
 	}
+	// An older database keeps its rows and gains the new tables from the
+	// idempotent DDL above; only the version marker moves.
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE vfs_meta SET value = ? WHERE key = 'schema_version' AND value < ?`,
+		schemaVersion, schemaVersion,
+	); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("bump schema version: %w", err)
+	}
 	if _, err := db.ExecContext(context.Background(),
 		`INSERT OR IGNORE INTO vfs_nodes(inode, type, mode, size, mtime, rev) VALUES (?, 'dir', ?, 0, 0, 0)`,
 		rootInode, 0o755,
 	); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("seed root: %w", err)
+	}
+	gen, err := newGeneration()
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT OR IGNORE INTO vfs_sync(id, generation) VALUES ('', ?)`, gen,
+	); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("seed sync row: %w", err)
 	}
 
 	s := &Store{

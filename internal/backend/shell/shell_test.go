@@ -146,8 +146,9 @@ func TestStartFailureIsAnError(t *testing.T) {
 		t.Fatalf("connect: %v", err)
 	}
 	missing := filepath.Join(t.TempDir(), "missing")
+	out := execout.NewSink(context.Background(), nil, execout.DefaultLimits, "", "")
 	if _, err := h.Exec(context.Background(),
-		runtime.Request{Source: "true", Dir: missing}); err == nil {
+		runtime.Request{Source: "true", Dir: missing, Output: out}); err == nil {
 		t.Fatal("exec in a missing directory succeeded, want an error")
 	}
 }
