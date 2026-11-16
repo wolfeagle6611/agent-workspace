@@ -148,6 +148,10 @@ _Avoid_: disk, volume mount, bind mount
 Dynamic Worker 里的一段隔离 JavaScript。它没有真实网络，也没有真实文件系统。
 _Avoid_: sandbox（与容器混用会失真）, VM, microVM
 
+**Sandbox**:
+一个 Firecracker guest，里面跑不可信的 agent 代码。它与 Workspace 是两件事：Workspace 是被读写的命名空间，Sandbox 是执行它的机器。一个 Sandbox 可挂多个 Workspace。
+_Avoid_: microVM, VM（都太泛）, container（指 userland 部分时例外）
+
 ### 容易混淆的词
 
 **Stub**:
