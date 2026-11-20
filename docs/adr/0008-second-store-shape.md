@@ -44,7 +44,7 @@ ADR 0006 把水位、合并、探测补字节推到第二阶段，触发条件�
 - 目录创建不产生变更事件（§6 既有约定）。因此空目录不传播，父目录随子项出现。要改先回来改这一条。
 - `Handle` 缓存放 `Runtime`，按 backend id 单飞，`Closed()` 关闭即丢。§6 的“每次 Exec 一次 Connect / Close”作废。
 - `runtime.Result` 加 `Sync`（`Complete` / `Pending`），因为 pull 失败不改写命令结果。
-- GC 两侧共用，规则为“无引用且 `last_seen` 早于 60 秒”，触发点是 `Close` 与 blob 数量阈值。GC 不铸 `rev`。
+- GC 两侧共用，规则为“无引用且 `last_seen` 早于 1 小时”，触发点是 `Close` 与 blob 数量阈值。GC 不铸 `rev`。
 
 ## 落地顺序
 

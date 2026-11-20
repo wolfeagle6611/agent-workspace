@@ -304,7 +304,7 @@ func (w *Workspace) execContainer(ctx context.Context, cmd string, opts ExecOpti
 | 未知 exec id | 注册表里没有这个名字时回 `EEXEC_LOST` | “丢失”与“没有”是两种事实（§6 执行记录） |
 | 输出编码 | 输出走 JSON 帧（`[]byte` 即 base64）；chunk 字节仍走原始分段 | 输出是小帧多、对象是大字节少；两种形状各用各的编码 |
 | 结果形状 | `Result{Status, ExitCode, Output, Sync}`；pull 失败只置 `Sync = Pending` | pull 失败不改写命令结果，但调用方必须知道这轮没回流 |
-| blob GC | 两侧共用一份实现，规则“无引用且 `last_seen` 早于 60 秒”，触发点为 `Close` 与数量阈值；GC 不铸 `rev` | GC 不是变更，不能推进游标；60 秒覆盖“探测与补字节之间”的空档 |
+| blob GC | 两侧共用一份实现，规则“无引用且 `last_seen` 早于 1 小时”，触发点为 `Close` 与数量阈值；GC 不铸 `rev` | GC 不是变更，不能推进游标；1 小时覆盖“探测与补字节之间”与“暂存未链接”两段空档（`fs/gc.ts:17`） |
 
 ## 7. 错误模型
 

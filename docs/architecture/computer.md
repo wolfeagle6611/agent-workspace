@@ -1,6 +1,6 @@
 # Cloudflare Computer 架构梳理
 
-> 基线：`cloudflare/computer` 主分支（浅克隆于 2026-03，`package.json` 版本线 0.11.x）。
+> 基线：`cloudflare/computer` 主分支 `9d11fa7`（Release v0.11.3，2026-11-17）。
 > 引用规则：以 `packages/` 代码为准。`docs/` 为前瞻性规格，与代码不符处标 `⚠️`。
 > 图源码同存 `docs/diagrams/*.mmd`。使用 `flowchart` 而非 Mermaid C4，避免渲染器差异。
 
@@ -231,7 +231,7 @@ committed:    0..N 个 vfs_chunks 行, manifest_hash 可选
 
 ### 4.4 垃圾回收
 
-`gc()` 扫 `vfs_blobs` 与 `vfs_manifests`，删除无引用且 `last_seen` 超过安全窗口（默认 60 秒）的行，级联删字节。
+`gc()` 扫 `vfs_blobs` 与 `vfs_manifests`，删除无引用且 `last_seen` 超过安全窗口的行，级联删字节。安全窗口是参数，默认 **1 小时**（`fs/gc.ts:17` 的 `DEFAULT_SAFETY_WINDOW_MS`），没有调用点传更小的值。窗口要覆盖两段空档：探测与补字节之间，以及接收方暂存但未链接的 blob。
 
 作者刻意不把 `gc()` 放到公开 API。理由写在文档里：agent 不该驱动回收，函数形状（可注入 `now`）是为测试而不是为产品。这个判断值得记住：**能省的抽象就省**。
 
@@ -325,8 +325,8 @@ sequenceDiagram
 | 故障 | 行为 |
 | --- | --- |
 | WebSocket 断开 | 丢掉 Handle，下次 `ready()` 重新握手。push/pull 内部重试一次。 |
-| push 中断 | 水位未推进，重放。接收方整批在一个事务里应用，看不到半批。 |
-| pull 中断 | 从最后提交的批续。最多重取 256 条。 |
+| push 中断 | 水位未推进，重放。接收方把整批写在一个事务里应用（`applyChangesSync`），看不到半批。 |
+| pull 中断 | 从最后提交的批续。最多重取 256 条。注意 pull 方向不是整批一个事务：逐条提交，游标每批推进，重放靠 `alreadyApplied` 丢掉已应用条目。 |
 | 容器在命令执行中挂掉 | 命令不重放。`getExec` / `killExec` 遇到新 runtime 返回 `EEXEC_LOST`。 |
 | 命令完成后 pull 失败 | 结果仍是 `completed`，`sync.status: "pending"`。后续 `pull()` 续传。 |
 | 后续 pull 到达另一个容器 | 抛 `WorkspaceSyncLostError`，一次性，带丢失的 runtime id；下次 `pull()` 正常同步新容器。 |
@@ -615,6 +615,10 @@ issue #179 记录了真实现场：安装 120 秒超时，再花约 3 分钟 pul
 | 7 | `docs/07_injected_service.md` | `/health` 在 socket 绑定后即 200 | 代码在 FUSE 挂载完成后才 `listen`，所以 `/health` 通即 FUSE 已就绪 | 一致（文档已说明） |
 
 复核方法：`grep -rn "assertNotReadOnly" packages/dofs/src`、`grep -n "MountIndex" packages/computer/src/workspace.ts`。
+
+> 本文件旧版有两处说法过宽，已按代码改正：
+> 1. GC 安全窗口是 **1 小时**，不是 60 秒（`packages/dofs/src/fs/gc.ts:17`）。
+> 2. 「整批一个事务」只对 push 接收方成立。pull 方向逐条事务，游标每批推进（`packages/dofs/src/sync/apply.ts:377-390, 408-425`）。
 
 ---
 

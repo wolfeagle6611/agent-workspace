@@ -523,7 +523,9 @@ type Blob struct {
 //
 // Push sends objects after the receiver says which hashes it lacks, so the
 // bytes land before the change that uses them. A crash in between leaves an
-// unreferenced blob; the 60 second window in GC covers it (ADR 0008).
+// unreferenced blob; the GC safety window (1 hour, matching ADR 0008) covers
+// it. Callers pass the window to GC; nothing in this package assumes a
+// shorter one.
 func (s *Store) StageBlobs(ctx context.Context, objects []Blob) error {
 	return s.withWrite(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		now := s.lastSeen()
