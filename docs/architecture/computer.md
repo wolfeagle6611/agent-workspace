@@ -472,6 +472,8 @@ DO 化身 N ──(驱逐)──▶ 化身 N+1
 | 5 | 路径限制 | `resolvePath` 拒绝逃逸与穿越符号链接；只读 mount 抛 `EROFS` |
 | 6 | 密钥生命周期 | `RPC_CLIENT_SECRET` 读后从 `process.env` 删除，shell 子进程拿不到 |
 
+> 边界 3、4 的完整形状不止这一行策略表：出口策略定义在 `packages/computer/src/runtime/egress.ts`（`WorkspaceEgressPolicy`、`dynamicWorkerEgress`、`hostEgressFetch`），容器侧在 `backends/container/container-backend.ts`（`egressToken`、`NETWORK_DESCRIPTION`）。`http-gateway` 不携带任何策略，判定全在调用方的 `Fetcher` 里。对照我们自己的网关逐项取舍见 `egress-gateway-alignment.md`。
+
 ### 8.2 部署与信任边界
 
 ```mermaid

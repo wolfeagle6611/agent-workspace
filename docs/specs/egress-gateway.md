@@ -1,8 +1,9 @@
 # Spec: 沙箱出口网关与幽灵 token 注入
 
-状态：待发布（缺 issue tracker 配置）
-标签：`ready-for-agent`（发布时套用）
-相关 ADR：0010（出口网关）、0011（幽灵 token）、0013（Rust + Pingora 落地）、待写（临时 CA）
+状态：已发布（issue #1：`wolfeagle6611/sandbox-gateway`）
+标签：`ready-for-agent`
+相关 ADR：0010（出口网关）、0011（幽灵 token）、0013（Rust + Pingora 落地）、0015（判定权留在网关内）、0016（身份与信任模型）、待写（临时 CA）
+能力对齐：`docs/architecture/egress-gateway-alignment.md`
 
 ## Problem Statement
 
@@ -24,7 +25,7 @@
 - 网关终止 TLS，看到明文，按域名判定，改写 header，再转发。
 - 沙箱持有的不是真密钥，是**幽灵 token**。网关用幽灵 token 查表换真密钥。
 - 强制分两层：guest 内 iptables 是第一层，宿主 nftables 是第二层。沙箱 root 清规则不影响第二层。
-- 默认策略是默认放公网 + 黑名单（不是白名单）。这条残余风险由用户承担，见 ADR 0010。
+- 默认策略是默认放公网 + 黑名单（不是白名单）。这条残余风险由用户承担，见 ADR 0010。个别沙箱可用 `policy = blocked` 关闭全部出网，见《断网沙箱》。
 
 ## User Stories
 
@@ -101,7 +102,7 @@ Pingora 只提供 HTTP 引擎，不提供监听层：`listening::Service` 无法
 
 - **CONNECT 监听**（每沙箱专属 Unix Domain Socket，L1 Socket Path Binding）：每个沙箱分配独立 socket 路径（如 `/run/egress/sandboxes/<sandboxId>/connect.sock`，挂载进容器或映射自 Firecracker vsock UDS），监听器在 `Accept()` 时直接绑定 `(sandboxId, sandboxCA)`，不靠报文头或源 IP 猜身份；接受 sidecar 的 `CONNECT IP:port`，初判端口（80/443）与目标 IP 非私网后回 `200 OK` 建立字节隧道；443 端口 peek ClientHello 取 SNI 并用该沙箱专属 CA 做 TLS 终止，80 端口直接解析明文 HTTP 取 `Host`，判策略，伪造上游请求，回写。
 - **DNS 监听**（UDP + TCP 53）：按同一张策略表应答或拒绝。上游解析也经它。
-- **provisioning 监听**（unix socket，`0600`）：HTTP/1.1 + JSON。负责沙箱注册与凭据写入：注册 `sandboxId`（创建专属 `connect.sock`、生成每沙箱临时根 CA 并返回公钥 `caCertPEM`；无凭据沙箱也调此步拿 socket 与 CA）、建绑定与铸幽灵 token、沙箱销毁时关停并删除专属 socket、删除宿主上的 CA 文件与删绑定。
+- **provisioning 监听**（unix socket，`0600`）：HTTP/1.1 + JSON。负责沙箱注册与凭据写入：注册 `sandboxId`（可选 `policy`，见《断网沙箱》；创建专属 `connect.sock`、生成每沙箱临时根 CA 并返回公钥 `caCertPEM`；无凭据沙箱也调此步拿 socket 与 CA）、建绑定与铸幽灵 token、沙箱销毁时关停并删除专属 socket、删除宿主上的 CA 文件与删绑定。注册身份与重复注册的规则见《一 Sandbox 一身份》。
 
 策略判定拆成 `src/policy.rs` 的纯函数：输入 `(port, host, sni, ips, method)`，输出 `Decision`。四个判定点都调它，不各写一份逻辑。
 
@@ -163,8 +164,22 @@ pub struct Decision {
 - 网关重启：扫描沙箱目录，重新加载每个沙箱的 CA，重新监听其 `connect.sock`。CA 不变，沙箱信任库仍有效，sidecar 重新建联即可。
 - 因为重启会重建 socket 文件，挂进沙箱的必须是 socket 所在目录，不能是 socket 文件本身（文件级 bind mount 在 inode 变化后会指向旧文件）。
 - 公钥由 provisioning 返回并经 vsock 交给 guest init，在用户代码之前写入信任库，并导出四个环境变量。
+- 注入的 CA 必须同时写入发行版 anchors 目录（`/usr/local/share/ca-certificates` 或 `/etc/pki/ca-trust/source/anchors`），使后续 `update-ca-certificates` 不会移除它。归属镜像维护者，不在网关仓。
+- **不做**「等待 CA 出现」：provisioning 同步返回 `caCertPEM`，沙箱启动前 CA 已存在，等待不增加任何保证。
+- **不做**「信任库幂等去重」：同一沙箱的 CA 跨重启不变（网关从沙箱目录加载），重复写入同一张证书无害。
+- **已知残留风险**：身份等于「能打开该 `connect.sock`」。宿主上以 root 运行、或被授予该沙箱目录读权限的进程，可以冒充该沙箱。这与上游同层风险等价（上游的出口 token 存在后端进程内存里，能读该内存的一方同样可以冒充）。因此不引入逐跳凭证。
 - 叶证书只用当前 socket 绑定的 `sandboxCA` 签当前 host，不签通配。
 - 网关用 `-tls-intercept` 关闭的 sidecar，TLS 终止发生在网关，不在 guest。
+
+### 一 Sandbox 一身份
+
+一个沙箱属于一个 `(tenantId, userId)`，注册时钉住，之后不可更改。
+
+- `bind` 从已注册的沙箱取身份，请求体不能指定 `tenant` / `userId`。绑定因此不会记到别的租户名下。
+- 重复注册同一 `sandboxId` 时逐字比较 `(tenantId, userId)`，空串是合法值：
+  - 相同 → 幂等，返回同一 `caCertPEM` 与 socket。
+  - 不同 → `409 EIDENTITY`。换身份只能换沙箱：不静默沿用旧身份，也不重建沙箱。
+- 因为身份只来自「哪个 socket `Accept()` 到」，不做按命令切换出口，也不需要容器级重路由（见 ADR 0016）。
 
 ### 错误码
 
@@ -176,6 +191,7 @@ pub struct Decision {
 | `EBADPHANTOM` | 绑定 host 上带了绑定 header，但值（含 Basic 解码后的字段）不是幽灵 token，或 Basic 解码失败 |
 | `EDENIED` | 黑名单、443 无 SNI、80 无 `Host` 或命中绑定 host、私有地址、端口不在 80/443 |
 | `EBINDING` | 绑定无法加载（通配 host、无 SNI 目标、缺字段） |
+| `EIDENTITY` | 重复注册时 `(tenantId, userId)` 与已注册的不同。provisioning 期错误，不是请求期错误 |
 | `EUPSTREAM` | 网关到上游失败 |
 
 拒绝对外表现为 **连接被断开**，不是 HTTP 403。一律不写 HTTP 错误页。
@@ -197,6 +213,15 @@ pub struct Decision {
 ### 默认策略
 
 默认放公网 + 黑名单。端口只放 80/443。`UDP 443` 丢弃，不支持 HTTP/3。v1 关闭 IPv6。
+
+### 断网沙箱（`policy = blocked`）
+
+注册体可带 `policy`，取值 `default` 或 `blocked`，缺省 `default`。
+
+- `blocked` 是**允许列表为零**，不是黑名单加满。语义要让读者一眼看出「这个沙箱没有出网」，而不是「这个沙箱有一长串禁止目标」。
+- 开关随沙箱注册落盘，与 CA、socket 同生命周期：沙箱销毁即失效，网关重启从沙箱目录恢复。
+- 变更只能靠重新注册，不做运行期切换。与「策略只重启生效、没有热载」保持一致。
+- 判定入口多收一个参数；`blocked` 直接 `EDENIED`，不看黑名单与端口。
 
 ## Testing Decisions
 
@@ -230,6 +255,7 @@ pub struct Decision {
 - 吊销（后期实现）。v1 不保证吊销即时生效：网关本地缓存 TTL 5 分钟内，已删的 Redis 绑定仍可能被使用。
 - 多租户鉴权与配额（沿用 `go-mapping.md` §8 的推迟）。
 - 白名单模式、DLP、请求体扫描。
+- 调用方自定义判定（`Fetcher` 式策略插件）。判定权留在网关内，见 ADR 0015。
 - IPv6 双栈、HTTP/3、非 80/443 端口。
 - Firecracker 的编排、快照、镜像构建流水线。
 - Workspace 如何映射进 Firecracker guest（virtio-fs 还是 guest 内镜像 + vsock 同步）。这一条另开 ADR。
