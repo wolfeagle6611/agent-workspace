@@ -130,6 +130,12 @@ pub struct Decision {
 }
 ```
 
+**认证载体扩展（实现扩展）。** 除 header 外还支持两种载体：
+
+- **query 参数**： 除 header 外，绑定可声明把凭据放进一个 query 参数（`kind = api_key_query`，参数名在绑定的 `params.name`）。三条约束：参数名只允许 `[A-Za-z0-9_.-]` 且最长 32；值百分号编码后写入；这类请求必须压掉网关的错误日志摘要（它含 path 与 query），否则真密钥会进日志。
+
+**签名载体（SigV4）。** 客户端把幽灵 token 放在 `Authorization` 的 access key 位（`Credential=<幽灵>/<scope>`）。网关先校验归属，再丢弃客户端签名，用真密钥对「方法 + 路径 + 排序后的 query + 头 + body 的 SHA-256」重算，并覆盖 `x-amz-date` 与 `x-amz-content-sha256`。该方式需要完整 body，因此走签名通道；`params.region`、`params.service` 必填且只允许小写字母、数字与 `-`，缺失或不合规在建绑定时返回 `409 EBINDING`。网关不支持 `UNSIGNED-PAYLOAD`、分块流式签名与 presigned query 签名。
+
 幽灵 token 格式固定：`phantom_<sandboxId 前 8 位>_<128 bit 随机，32 个 hex 字符>`。
 
 ### 请求路径
